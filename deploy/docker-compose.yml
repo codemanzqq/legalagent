@@ -1,0 +1,69 @@
+# Redis + Milvus（standalone）本地依赖。
+#
+# 镜像说明：
+# - redis / minio / milvus 使用 DaoCloud 同步的 docker.io 命名空间，减轻 registry-1.docker.io EOF。
+# - etcd 必须用 quay.io（DaoCloud 不支持把 quay 路径拼在 docker.m.daocloud.io 后面，会报 invalid repository）。
+#   拉 quay 需能访问外网：开红岸/其它代理后执行 docker compose pull。
+#
+# 无代理时：可只配 Docker Engine 的 registry-mirrors（见同目录 docker-daemon-cn.json），
+# 但 etcd 仍建议用能访问 quay.io 的网络单独拉取：docker pull quay.io/coreos/etcd:v3.5.5
+#
+# MySQL 使用小皮本地实例时，请勿映射 3306 端口以免冲突。
+
+services:
+  redis:
+    # DaoCloud 同步的 Docker Hub library/redis
+    image: docker.m.daocloud.io/library/redis:7-alpine
+    container_name: xiaoyi-redis
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+
+  etcd:
+    container_name: milvus-etcd
+    # 官方镜像在 quay.io；勿使用 docker.m.daocloud.io/quay.io/...（DaoCloud 会拒识该仓库路径）
+    image: quay.io/coreos/etcd:v3.5.5
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    volumes:
+      - etcd-data:/etcd
+    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+
+  minio:
+    container_name: milvus-minio
+    image: docker.m.daocloud.io/minio/minio:RELEASE.2023-03-20T20-16-18Z
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    volumes:
+      - minio-data:/minio_data
+    command: minio server /minio_data
+
+  standalone:
+    container_name: milvus-standalone
+    image: docker.m.daocloud.io/milvusdb/milvus:v2.4.6
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+    volumes:
+      - milvus-data:/var/lib/milvus
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    depends_on:
+      - etcd
+      - minio
+
+volumes:
+  redis-data:
+  etcd-data:
+  minio-data:
+  milvus-data:
