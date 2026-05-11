@@ -4,16 +4,15 @@
 说明：`__pycache__`、`node_modules`、`.pytest_cache`、`.venv` 等为运行生成物或本地环境，**不以下方树为必须提交内容**；树中只列仓库内应存在的源码与配置路径。
 
 ```text
-Legal_System/                        # 本仓库根目录（旧文档曾误写为 Chinese_Medicine_System，已废弃该名称）
+Legal_System/                        # 本仓库根目录
 ├── .env                              # 本地/部署实际配置（勿提交公共仓库）
 ├── .env.example                      # 环境变量模板（复制为 .env 后填写）
-├── pyproject.toml                    # 项目元数据、依赖、pytest/ruff；testpaths = offline/tests
+├── pyproject.toml                    # 既是项目工具说明书也是依赖文件、pytest/ruff；testpaths = offline/tests（当运行pytest时，通过pyproject.toml找到对应测试目录及数据等，开发时可选用，生产不用，如果是装依赖的话requirements.txt就够 ）
 ├── requirements.txt                  # pip 运行时依赖
-├── requirements-dev.txt              # 开发依赖（pytest、ruff 等）
-├── uv.lock                           # 与 pyproject 配套的 uv 锁定文件
+├── requirements-dev.txt              # 需要ai在本地改代码，像仓库管理维护者一样跑测试、检查格式（pytest(自动测试代码对不对的工具)、ruff(检查代码风格和常见问题的工具、保持代码干净) 等）
+├── uv.lock                           # 与 pyproject 配套的 uv 锁定文件（如果有人用uv管理依赖，会用该文件锁定每一个包的依赖版本，其他人执行uv  sync就能复现同一套环境，本项目用conda环境所以不用管）
 ├── ARCHITECTURE.md                   # 本文：架构与目录说明
 ├── 启动与部署.md                    # 启动顺序、依赖服务与运维入口
-├── 授课大纲-项目落地.md              # 按模块/课时的教学大纲（偏后端与数据流）
 │
 ├── backend/                          # HTTP API 层（FastAPI），与领域逻辑解耦
 │   └── app/
