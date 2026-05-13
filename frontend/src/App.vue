@@ -1,101 +1,108 @@
 <!--
-  对话页根组件：顶部标题区 + 消息列表（用户/助手）+ 输入框；通过 fetch 读 SSE 流式拼接助手回复。
-  请求体携带 user_external_id（localStorage 持久化 UUID），供后端 users_tab / his_chat_tab 记忆功能；
-  详见仓库根目录「启动与部署.md」第 7 节。
+=============================================================================
+教学说明：本文件在整体链路中的位置
+-----------------------------------------------------------------------------
+输入：用户在 textarea 中的文本；localStorage 中键 xiaoyi_user_external_id（若无则生成 UUID）。
+输出：浏览器内 messages 列表更新；向 POST /api/chat/stream 发送 JSON；解析 SSE 增量更新助手气泡。
+被谁调用：浏览器加载前端入口后由 Vite 挂载本组件；不经过 Python，仅通过 HTTP 与 FastAPI 通信。
+与后端契约：请求体 { message, user_external_id }；响应 text/event-stream，每行 data: {...}。
+=============================================================================
+对话页根组件：消息列表 + 输入框；fetch 流式读 SSE，把 chunk 拼到当前助手消息上。
 -->
 <script setup>
-// Vue 3 编译宏：<script setup> 顶层绑定自动暴露给模板，无需 export default
-import { nextTick, ref } from "vue";
+// Vue 3 编译宏：script setup 顶层变量/函数自动暴露给模板，无需 export default
+import { nextTick, ref } from "vue"; // nextTick：DOM 更新后再滚动；ref：响应式包装基本类型/对象
 
-const input = ref(""); // 输入框双向绑定内容
+const input = ref(""); // 输入框绑定值；初始空字符串
 const messages = ref([
   {
     role: "assistant",
     text: "你好，我是智能小易。我可以结合税法、劳动法知识库为你解答。试试问我「经济补偿金如何计算？」",
   },
-]); // 对话历史：每项含 role / text，助手流式时可带 streaming 标记
-const loading = ref(false); // 发送中禁用按钮防重复提交
-const listRef = ref(null); // 消息列表容器，用于滚动到底
+]); // 初始一条欢迎语；后续 push 用户/助手消息
+const loading = ref(false); // true 时禁用发送按钮，防连点
+const listRef = ref(null); // 绑定模板里消息列表容器的 DOM 引用，用于 scrollTop
 
-// 与后端 ChatRequest.user_external_id 对应；同一浏览器复用同一 id，清空 localStorage 即视为新用户
+// 与后端 ChatRequest.user_external_id 一致：同一浏览器固定一个 UUID，清空 localStorage 即新用户
 const USER_KEY = "xiaoyi_user_external_id";
 function getOrCreateUserExternalId() {
-  let id = localStorage.getItem(USER_KEY);
+  let id = localStorage.getItem(USER_KEY); // 尝试读取已有 id
   if (!id) {
-    id = crypto.randomUUID(); // Web Crypto：无需额外依赖
-    localStorage.setItem(USER_KEY, id);
+    id = crypto.randomUUID(); // 标准 Web API 生成 UUID v4
+    localStorage.setItem(USER_KEY, id); // 持久化到浏览器本地存储
   }
-  return id;
+  return id; // 每次请求带上，后端据此关联 users_tab
 }
 
 async function scrollToBottom() {
-  await nextTick(); // 等待 DOM 更新后再读 scrollHeight
-  const el = listRef.value;
-  if (el) el.scrollTop = el.scrollHeight;
+  await nextTick(); // 等待 Vue 把新消息渲染进 DOM
+  const el = listRef.value; // 取 div.messages 元素
+  if (el) el.scrollTop = el.scrollHeight; // 滚动条置底，显示最新消息
 }
 
 async function send() {
-  const q = input.value.trim();
-  if (!q || loading.value) return; // 空内容或加载中不发请求
-  messages.value.push({ role: "user", text: q });
-  input.value = "";
-  loading.value = true;
-  messages.value.push({ role: "assistant", text: "", streaming: true }); // 预占位以便流式追加
+  const q = input.value.trim(); // 去掉首尾空白
+  if (!q || loading.value) return; // 空问题或加载中：不发请求
+  messages.value.push({ role: "user", text: q }); // 用户气泡立即出现
+  input.value = ""; // 清空输入框
+  loading.value = true; // 进入加载态
+  messages.value.push({ role: "assistant", text: "", streaming: true }); // 先占位一条空助手消息，streaming 用于显示「思考中」
   await scrollToBottom();
 
-  const idx = messages.value.length - 1; // 当前助手气泡索引
+  const idx = messages.value.length - 1; // 刚追加的助手消息下标
   try {
     const res = await fetch("/api/chat/stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ message: q, user_external_id: getOrCreateUserExternalId() }),
-    });
+    }); // Vite dev 会把 /api 代理到后端，见 vite.config.js
     if (!res.ok || !res.body) {
+      // HTTP 4xx/5xx 或浏览器不支持 body 流
       messages.value[idx].text = `请求失败：${res.status}`;
       messages.value[idx].streaming = false;
       loading.value = false;
       return;
     }
-    const reader = res.body.getReader(); // ReadableStream 读取器
-    const decoder = new TextDecoder();
-    let buf = ""; // 半行缓冲（SSE 可能被 TCP 拆包）
+    const reader = res.body.getReader(); // 取得 ReadableStreamDefaultReader
+    const decoder = new TextDecoder(); // UTF-8 字节解码为字符串
+    let buf = ""; // 累积半行：SSE 可能把一行拆成多次 read
     while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      const lines = buf.split("\n");
-      buf = lines.pop() || "";
+      const { done, value } = await reader.read(); // 读下一块 Uint8Array
+      if (done) break; // 流结束
+      buf += decoder.decode(value, { stream: true }); // stream:true 表示后续还有字节，避免多字节字符截断
+      const lines = buf.split("\n"); // 按换行切
+      buf = lines.pop() || ""; // 最后一段可能不完整，留到下次与后续字节拼接
       for (const line of lines) {
-        if (!line.startsWith("data: ")) continue;
-        const payload = line.slice(6).trim();
-        if (payload === "[DONE]") continue;
+        if (!line.startsWith("data: ")) continue; // 忽略 SSE 里非 data 行（如空行）
+        const payload = line.slice(6).trim(); // 去掉前缀 "data: "
+        if (payload === "[DONE]") continue; // 结束标记，无需 JSON 解析
         try {
-          const obj = JSON.parse(payload);
+          const obj = JSON.parse(payload); // 后端 json.dumps 的对象
           if (obj.chunk) {
-            messages.value[idx].text += obj.chunk;
-            await scrollToBottom();
+            messages.value[idx].text += obj.chunk; // 拼接到助手气泡
+            await scrollToBottom(); // 每块更新后跟随滚动
           }
           if (obj.error) {
-            messages.value[idx].text += `\n[错误] ${obj.error}`;
+            messages.value[idx].text += `\n[错误] ${obj.error}`; // 后端在流中返回的错误对象
           }
         } catch {
-          /* 忽略不完整 JSON 片段 */
+          /* JSON 被 TCP 截断时不完整，忽略本次等下一行 */
         }
       }
     }
   } catch (e) {
-    messages.value[idx].text = `网络错误：${e}`;
+    messages.value[idx].text = `网络错误：${e}`; // fetch 自身失败、断网等
   } finally {
-    messages.value[idx].streaming = false;
-    loading.value = false;
+    messages.value[idx].streaming = false; // 关闭「思考中」态
+    loading.value = false; // 恢复按钮
     await scrollToBottom();
   }
 }
 
 function onKey(e) {
   if (e.key === "Enter" && !e.shiftKey) {
-    e.preventDefault(); // 阻止默认换行，改为发送
-    send();
+    e.preventDefault(); // 阻止 textarea 默认插入换行
+    send(); // 改为发送消息
   }
 }
 </script>

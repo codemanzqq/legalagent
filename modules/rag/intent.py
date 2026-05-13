@@ -1,51 +1,62 @@
+# =============================================================================
+# 教学说明：本文件在整体链路中的位置
+# -----------------------------------------------------------------------------
+# 输入：用户问题纯文本 `question`；隐式读取 `.env` 中 DASHSCOPE_API_KEY 与意图模型名。
+# 输出：异步函数返回 `bool`：True 表示走专业检索+RAG，False 表示仅闲聊引导（仍可调 LLM）。
+# 被谁调用：`modules/rag/pipeline.py` 中 `stream_chat` 在记忆加载之后、向量检索之前调用。
+# =============================================================================
 """
-意图识别：区分「税法/劳动法等专业咨询」与闲聊；非专业则返回引导语不走检索。
+用小模型（如 qwen-turbo）做二分类：输出 JSON `{"professional": true|false}`。
 
-使用 DashScope 快模型输出 JSON；失败时默认视为专业问题以免阻断服务。
+无 API Key 或解析失败时默认 True，避免整个问答服务不可用。
 """
 
 from __future__ import annotations
 
-import json  # 解析模型返回的 JSON 片段
-import logging  # 记录意图调用异常
-import re  # 提取 JSON 子串
-from functools import lru_cache
+import json  # 把模型输出中的 JSON 子串解析成 dict
+import logging  # 记录异常与降级原因
+import re  # 从模型自然语言中抠出 {...} 片段
+from functools import lru_cache  # 意图用 ChatOpenAI 单例
 
-from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage, SystemMessage  # 两条消息组成对话
+from langchain_openai import ChatOpenAI  # OpenAI 兼容多轮 chat
 
-from modules.core.config import get_settings
-from modules.rag.dashscope_http import get_dashscope_async_client, get_dashscope_sync_client
+from modules.core.config import get_settings  # api_key、base_url、intent_model
+from modules.rag.dashscope_http import get_dashscope_async_client, get_dashscope_sync_client  # 自定义 httpx
 
 logger = logging.getLogger(__name__)
 
 
 @lru_cache
 def _intent_llm() -> ChatOpenAI:
-    """意图专用 ChatOpenAI：低温、短超时。"""
+    """
+    构造专用于意图分类的 ChatOpenAI：低温、短超时，与主生成模型分离。
+    """
     s = get_settings()
     return ChatOpenAI(
-        model=s.intent_model,
-        temperature=0.0,
+        model=s.intent_model,  # 如 qwen-turbo，比 qwen-max 便宜
+        temperature=0.0,  # 分类任务要确定性，温度置 0
         api_key=s.dashscope_api_key,
         base_url=s.dashscope_base_url,
-        timeout=30,
-        http_client=get_dashscope_sync_client(),
-        http_async_client=get_dashscope_async_client(),
+        timeout=30,  # 意图应快，30 秒超时
+        http_client=get_dashscope_sync_client(),  # LangChain 内部偶发同步请求用
+        http_async_client=get_dashscope_async_client(),  # ainvoke 主路径
     )
 
 
-_JSON_FENCE = re.compile(r"\{[^{}]*\}")  # 宽松匹配单行 JSON 对象
+_JSON_FENCE = re.compile(r"\{[^{}]*\}")  # 非贪婪匹配最外层一对花括号内无嵌套花括号的 JSON（简单场景够用）
 
 
 async def is_professional_query(question: str) -> bool:
-    """True：进入检索+RAG；False：仅友好引导。"""
-    if not question.strip():  # 空问题不调用模型
-        return False
+    """
+    调用意图模型；解析失败返回 True（保守：宁可多检索也不要误杀专业问题）。
+    """
+    if not question.strip():  # 全空白
+        return False  # 空问题不做检索
     s = get_settings()
-    if not s.dashscope_api_key:  # 无密钥无法调用意图模型，放行检索以免服务不可用
+    if not s.dashscope_api_key:  # 未配置密钥
         logger.warning("DASHSCOPE_API_KEY 未配置，跳过意图识别，默认 professional=True")
-        return True
+        return True  # 降级：直接进入检索
 
     sys = SystemMessage(
         content=(
@@ -53,16 +64,16 @@ async def is_professional_query(question: str) -> bool:
             "企业与劳动者权利义务等「专业知识」咨询。"
             "仅输出 JSON：{\"professional\": true|false}，不要其他文字。"
         ),
-    )
-    human = HumanMessage(content=f"问题：{question.strip()}")  # 用户原问句送入分类器
+    )  # 系统角色：约束输出格式
+    human = HumanMessage(content=f"问题：{question.strip()}")  # 用户内容：只带问题文本
     try:
-        resp = await _intent_llm().ainvoke([sys, human])  # 意图分支固定用小模型降本
-        text = str(resp.content)  # 期望正文含一段 JSON
-        m = _JSON_FENCE.search(text)  # 从模型输出中提取 {...} 片段
-        if not m:  # 未匹配到 JSON 则保守视为专业问题
-            return True
-        data = json.loads(m.group(0))  # 解析 professional 布尔值
-        return bool(data.get("professional", True))  # 缺省 True：避免误判阻断检索
-    except Exception as exc:  # noqa: BLE001 — 解析/网络失败时默认走专业链路
+        resp = await _intent_llm().ainvoke([sys, human])  # 异步调用 DashScope
+        text = str(resp.content)  # 模型返回可能是 str 或其它，统一转 str
+        m = _JSON_FENCE.search(text)  # 在整段输出里找 JSON 片段
+        if not m:  # 模型没按格式输出
+            return True  # 保守当专业
+        data = json.loads(m.group(0))  # 解析 JSON 字符串为 dict
+        return bool(data.get("professional", True))  # 缺 key 时默认 True
+    except Exception as exc:  # noqa: BLE001 — 网络/JSON/模型错误
         logger.warning("intent classify failed: %s", exc)
-        return True
+        return True  # 失败则走专业链路

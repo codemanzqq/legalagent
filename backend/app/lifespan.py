@@ -1,76 +1,95 @@
+# =============================================================================
+# 教学说明：本文件在整体链路中的位置
+# -----------------------------------------------------------------------------
+# 输入：FastAPI `app` 实例（仅类型用）；配置项 `HOT_UPDATE_ENABLED`、间隔秒数。
+# 输出：`asynccontextmanager`：yield 前完成建表、连 Milvus、可选后台任务；yield 后取消任务。
+# 被谁调用：`main.py` 中 `FastAPI(..., lifespan=app_lifespan)`，由 ASGI 服务器在启动/关闭时驱动。
+# =============================================================================
 """
-应用生命周期（lifespan）：启动时初始化数据库与 Milvus，可选启动后台热更新任务。
+启动顺序：MySQL 表结构 ensure → Milvus connect →（可选）后台循环全量同步 MySQL→Milvus。
 
-热更新开关与间隔来自 `.env`：`HOT_UPDATE_ENABLED`、`HOT_UPDATE_INTERVAL_SECONDS`。
+热更新适合开发环境「改库后自动刷新向量」；生产需评估全量 recreate 成本。
 """
 
 from __future__ import annotations
 
-import asyncio  # 异步 IO 与后台任务
-import logging  # 日志
-from collections.abc import AsyncIterator  # 异步生成器类型注解
-from contextlib import asynccontextmanager  # 将异步上下文管理器用于 FastAPI lifespan
+import asyncio
+import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI  # 仅用于类型提示 lifespan 参数
+from fastapi import FastAPI
 
-from modules.core.config import get_settings  # 读取配置
-from modules.database.models import Base  # ORM 元数据，用于 create_all
-from modules.database.session import get_async_engine  # 异步引擎工厂
-from modules.ingestion.milvus_sync import run_sync_job  # MySQL → Milvus 全量同步
-from modules.milvus_store.client import ensure_milvus  # 建立 PyMilvus 连接
+from modules.core.config import get_settings
+from modules.database.models import Base
+from modules.database.session import get_async_engine
+from modules.ingestion.milvus_sync import run_sync_job
+from modules.milvus_store.client import ensure_milvus
 
 logger = logging.getLogger(__name__)
 
 
 async def _ensure_tables() -> None:
-    """若表不存在则创建（幂等）；与离线脚本共用同一套模型定义。"""
-    engine = get_async_engine()  # 获取单例异步引擎
-    async with engine.begin() as conn:  # 开启事务上下文
-        await conn.run_sync(Base.metadata.create_all)  # 同步函数包一层以在 async 中执行
+    """
+    `Base.metadata.create_all`：已存在的表不会删数据，只补缺失表（开发友好）。
+    """
+    engine = get_async_engine()
+    async with engine.begin() as conn:  # begin 自动事务
+        await conn.run_sync(Base.metadata.create_all)  # SQLAlchemy 同步 API 包到 run_sync
 
 
 async def _ensure_milvus() -> None:
-    """Web 进程与离线脚本进程分离，必须在服务启动时单独 connect，否则首次向量检索报错。"""
-    await asyncio.to_thread(ensure_milvus)  # pymilvus 为同步 API，放到线程池避免阻塞事件循环
+    """
+    `ensure_milvus` 为同步阻塞：用 to_thread 避免阻塞 asyncio 启动阶段其它协程。
+    """
+    await asyncio.to_thread(ensure_milvus)
 
 
 async def _hot_update_loop(stop: asyncio.Event) -> None:
-    """后台循环：按固定间隔触发一次 Milvus 全量同步（开发期简化一致性）。"""
-    settings = get_settings()  # 读取最新配置（若支持热重载可生效）
-    interval = float(settings.effective_hot_update_interval_seconds)  # <=0 时回退为 60 秒
+    """
+    循环：每 `interval` 秒或被 `stop` 唤醒；超时则尝试 `run_sync_job()`。
+
+    `stop.wait()` 与 `wait_for` 结合：既支持定时又支持优雅退出。
+    """
+    settings = get_settings()
+    interval = float(settings.effective_hot_update_interval_seconds)
     logger.info("milvus hot-update worker started, interval=%ss", interval)
-    while not stop.is_set():  # 收到停止信号前一直运行
+    while not stop.is_set():  # 主循环直到 stop 被 set
         try:
-            await asyncio.wait_for(stop.wait(), timeout=interval)  # 等待 stop 或超时
+            await asyncio.wait_for(stop.wait(), timeout=interval)  # 等 stop 或超时
         except asyncio.TimeoutError:
-            pass  # 超时表示到达下一轮同步周期
+            pass  # 正常定时唤醒
         else:
-            break  # stop 被设置，退出循环
-        if not settings.hot_update_enabled:  # 运行中关闭热更新则跳过本次
+            break  # stop.wait() 返回说明 Event 已触发，退出 while
+        if not settings.hot_update_enabled:  # 运行中可在下一轮检查（注：settings 非热重载单例细节略）
             continue
         try:
-            await run_sync_job()  # 执行全量同步（内部会 recreate 集合，视实现而定）
-        except Exception as exc:  # noqa: BLE001 — 后台任务不因单次失败退出
+            await run_sync_job()  # 异步全量同步（内部 to_thread 写 Milvus）
+        except Exception as exc:  # noqa: BLE001
             logger.exception("hot milvus sync failed: %s", exc)
 
 
 @asynccontextmanager
 async def app_lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """FastAPI lifespan：yield 之前做启动逻辑，yield 之后做清理逻辑。"""
-    await _ensure_tables()  # 先保证 MySQL 表结构存在
-    await _ensure_milvus()  # 再连接向量库
+    """
+    FastAPI 约定：`yield` 之前是 startup，`yield` 之后是 shutdown（在 finally 语义里）。
+
+    `yield` 的值类型此处为 `None`，表示不向上下文块传递对象。
+    """
+    await _ensure_tables()
+    await _ensure_milvus()
     settings = get_settings()
-    stop = asyncio.Event()  # 用于通知后台任务结束
-    task: asyncio.Task | None = None  # 后台任务句柄
-    if settings.hot_update_enabled:  # 仅开启时启动同步循环
-        task = asyncio.create_task(_hot_update_loop(stop))
+    stop = asyncio.Event()  # 子任务看此事件决定是否退出
+    task: asyncio.Task | None = None
+    if settings.hot_update_enabled:
+        task = asyncio.create_task(_hot_update_loop(stop))  # 丢到事件循环并发执行
     try:
-        yield  # 此处开始对外提供服务
+        yield  # 此处放行：开始接受 HTTP 请求
     finally:
-        stop.set()  # 通知循环退出
-        if task:  # 若曾创建任务则取消并等待
-            task.cancel()
+        stop.set()  # 通知后台循环结束
+        if task:
+            task.cancel()  # 向 Task 注入 CancelledError
             try:
-                await task
+                await task  # 等待任务真正结束
             except asyncio.CancelledError:
-                pass  # 取消是预期行为
+                pass  # 取消是预期路径

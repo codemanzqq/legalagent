@@ -1,13 +1,20 @@
+# =============================================================================
+# 教学说明：本文件在整体链路中的位置
+# -----------------------------------------------------------------------------
+# 输入：多路「已按相关性排序的文档 id 列表」`ranked_lists`；平滑系数 `k`（通常与配置 HYBRID_RRF_K 一致）。
+# 输出：`(doc_id, 融合分数)` 元组列表，按分数降序；供后续取 Top 子块或父文档。
+# 被谁调用：`modules/rag/pipeline.py` 法律分支：一路 Milvus 稠密序 + 一路 BM25 序（可选）。
+# =============================================================================
 """
-RRF（Reciprocal Rank Fusion）：把多路有序候选列表融合为统一相关性分数。
+RRF（Reciprocal Rank Fusion）：不依赖各路的绝对分数，只利用「名次」融合多路排序。
 
-典型输入：稠密向量排序列表 + BM25 排序列表；输出按融合分降序。
+公式：对每个文档累加 1/(k+rank)，rank 从 1 开始；同一文档在多路都靠前则累加更高。
 """
 
 from __future__ import annotations
 
-from collections import defaultdict  # doc_id -> 累加 RRF 分数；首次访问默认 0.0
-from typing import Hashable  # doc_id 类型约束（int/str 等可哈希类型）
+from collections import defaultdict  # 当 key 不存在时默认值为 float 累加器 0.0
+from typing import Hashable  # doc_id 可能是 int（Milvus 主键）等可哈希类型
 
 
 def reciprocal_rank_fusion(
@@ -15,12 +22,12 @@ def reciprocal_rank_fusion(
     k: int = 60,
 ) -> list[tuple[Hashable, float]]:
     """
-    对每一路列表的第 rank 名文档贡献 1/(k+rank)；同一文档在多路累计加分。
+    `ranked_lists` 例如 `[[3,1,5],[5,3,7]]`：第一路认为 3 最相关，第二路认为 5 最相关。
 
-    k 常用 60（论文经验值）；越大则排名权重衰减越缓。
+    返回列表按融合分从高到低排序，便于 `fused[:30]` 截断。
     """
-    scores: dict[Hashable, float] = defaultdict(float)  # 融合分字典
-    for lst in ranked_lists:  # 遍历稠密排序、BM25 排序等各路列表
-        for rank, doc_id in enumerate(lst, start=1):  # rank 从 1 起，与 RRF 公式一致
-            scores[doc_id] += 1.0 / (k + rank)  # 名次越靠前权重越大
-    return sorted(scores.items(), key=lambda x: x[1], reverse=True)  # 按融合分从高到低输出 (doc, score)
+    scores: dict[Hashable, float] = defaultdict(float)  # doc_id -> 当前 RRF 累积分
+    for lst in ranked_lists:  # 遍历稠密路、BM25 路等
+        for rank, doc_id in enumerate(lst, start=1):  # enumerate(..., 1)：第一名 rank=1
+            scores[doc_id] += 1.0 / (k + rank)  # 该路该名次对 doc_id 的贡献
+    return sorted(scores.items(), key=lambda x: x[1], reverse=True)  # 按分数降序；item 为 (doc, score)

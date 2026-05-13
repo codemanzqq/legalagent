@@ -1,152 +1,157 @@
+# =============================================================================
+# 教学说明：本文件在整体链路中的位置
+# -----------------------------------------------------------------------------
+# 输入：无（类定义即「表结构」）；运行时由 SQLAlchemy 根据类生成 DDL 或与已有表映射。
+# 输出：`Base` 元类、`FaqTab` / `LegalTab` / `UserTab` / `HisChatTab` ORM 类，供 CRUD 与 `create_all` 使用。
+# 被谁调用：`mysql_loaders`（写入 FAQ/法律）、`milvus_sync`（读取行）、`pipeline`（按 id 查父文档）、
+#          `memory.service`（用户与历史）、`lifespan`（`Base.metadata.create_all`）。
+# =============================================================================
 """
-SQLAlchemy ORM 模型：FAQ / 法律文档入库表，以及在线用户的聊天记忆表。
+SQLAlchemy 2.0 声明式 ORM：一张 Python 类 ≈ 一张 MySQL 表，属性 ≈ 列。
 
-`faq_tab`：Excel 问答对；`legal_tab`：PDF 切块；`users_tab` / `his_chat_tab`：用户与历史对话。
+`Mapped[类型]` + `mapped_column(...)` 是推荐写法，IDE 能推断列类型。
 """
 
 from __future__ import annotations
 
-from datetime import datetime  # 时间戳字段默认值
+from datetime import datetime  # `default=datetime.utcnow` 插入时使用 UTC 时间
 
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Index, Integer, String, Text  # 列类型
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship  # ORM 声明式 API
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Index, Integer, String, Text  # 列类型与索引
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship  # ORM 基类与关系 API
 
 
 class Base(DeclarativeBase):
-    """所有模型的公共元类（metadata 挂载点）。"""
+    """
+    所有业务表的「共同基类」：`Base.metadata` 持有全部表结构，供 `create_all` 一次性建表。
+    """
+    pass  # 无需额外字段；DeclarativeBase 已提供 metadata 等机制
 
 
 class FaqTab(Base):
     """
-    高频问答业务表：一行对应 Excel 里的一条「问题—答案」。
-
-    离线：`mysql_loaders.load_faq_excel_to_mysql` 读 `data/法律问答对.xlsx` 写入本表；
-    同步：`milvus_sync` 仅将 `is_high_frequency=True` 的行的 `question` 做向量写入 Milvus FAQ 集合，
-    在线检索命中后用 `answer` 直出或拼进 LLM。
+    高频问答表：离线从 Excel 导入；在线 FAQ 向量检索命中后读 answer。
     """
 
-    __tablename__ = "faq_tab"  # 与离线脚本、SQLAlchemy metadata.create_all 使用的物理表名一致
+    __tablename__ = "faq_tab"  # 物理表名，与手写 SQL、Milvus 文档说明保持一致
 
     id: Mapped[int] = mapped_column(
-        BigInteger,
-        primary_key=True,
-        autoincrement=True,
-    )  # 主键：入库后生成；Milvus `xiaoyi_faq_highfreq` 集合主键与此相同，便于全量重建向量时不漂移
+        BigInteger,  # 主键用 BIGINT，与 Milvus INT64 id 对齐
+        primary_key=True,  # 主键约束
+        autoincrement=True,  # MySQL 自增；插入时可不传 id
+    )  # 一行一个 id；Milvus FAQ 集合主键与此相同，便于全量重建向量
 
     question: Mapped[str] = mapped_column(
-        Text,
-        nullable=False,
-    )  # 用户侧检索用语：在线 FAQ 分支对「当前用户问题」与该字段做向量相似度比对（COSINE）
+        Text,  # 长文本类型
+        nullable=False,  # 不允许 NULL
+    )  # 用户问题文本；向量索引与检索都基于该字段的语义
 
     answer: Mapped[str] = mapped_column(
         Text,
         nullable=False,
-    )  # 业务答案正文：高相似度时可不经 LLM 直接返回；略低相似度时可作为 Few-shot 上下文片段
+    )  # 标准答案；高相似度时可不经 LLM 直接返回
 
     is_high_frequency: Mapped[bool] = mapped_column(
         Boolean,
-        default=True,
+        default=True,  # 新插入行默认 True
         nullable=False,
-    )  # True：参与 `_fetch_faq_rows` → Milvus 同步；False：仅占 MySQL，不向 FAQ 向量集合写入（可用于临时下架）
+    )  # False 表示不参与 Milvus 同步（下架或内部题）
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
-        default=datetime.utcnow,
-    )  # 首次插入时间：审计/排查导入批次（UTC，与 ORM 默认一致）
+        default=datetime.utcnow,  # 插入时自动填当前 UTC 时间
+    )  # 审计：首次入库时间
 
     updated_at: Mapped[datetime] = mapped_column(
         DateTime,
         default=datetime.utcnow,
-        onupdate=datetime.utcnow,
-    )  # 行变更时间：若后续提供后台改 FAQ，可用于增量同步策略（当前热更新多为全量重建 Milvus）
+        onupdate=datetime.utcnow,  # 任意 UPDATE 时自动刷新该列
+    )  # 审计：最后修改时间
 
 
 class LegalTab(Base):
     """
-    法律长文档分层存储：同一物理表混存「父文档」与「子块」，服务 RAG 两段式检索。
-
-    离线：`mysql_loaders.load_legal_pdfs_to_mysql` 按 PDF 页生成 parent 长文本，再在父文本上滑动窗口得到 child；
-    在线：`pipeline` 只在 Milvus `legal_child` 集合里检索子块向量，命中后用 `parent_id` 拉回父行 `content`
-    做 BM25/RRF 之后的父文档重排与生成上下文。
+    法律文档表：同一表存 parent（长文）与 child（切片）；child.parent_id 指向 parent.id。
     """
 
-    __tablename__ = "legal_tab"  # 父子两行共用此表，通过 doc_role / parent_id 区分角色
+    __tablename__ = "legal_tab"
 
     __table_args__ = (
-        Index("ix_legal_tab_source_file", "source_file", mysql_length=191),
-    )  # 按来源文件名筛选时走索引；utf8mb4 下一列索引超长，191 字符前缀即可支撑常用文件名过滤且避免 MySQL 1071
+        Index("ix_legal_tab_source_file", "source_file", mysql_length=191),  # 前缀索引：utf8mb4 下整列索引易超长
+    )  # 按文件名筛选用
 
     id: Mapped[int] = mapped_column(
         BigInteger,
         primary_key=True,
         autoincrement=True,
-    )  # 主键：parent 行与 child 行各自独立 id；Milvus 法律子集合仅嵌入 **child 行** id
+    )  # parent 行、child 行各有独立 id；仅 child 行 id 进入 Milvus
 
     source_file: Mapped[str] = mapped_column(
         String(512),
         nullable=False,
-    )  # 来源 PDF 文件名（非路径）：入库脚本据此归类；在线检索结果可展示给用户便于溯源
+    )  # PDF 文件名，便于展示来源
 
     doc_role: Mapped[str] = mapped_column(
         String(16),
         nullable=False,
-        index=True,
-    )  # 取值约定："parent" 表示聚合后的长段落；"child" 表示供向量/BM25 用的短切片（见 chunking 模块）
+        index=True,  # 单列索引：按 parent/child 过滤
+    )  # 约定字符串 "parent" 或 "child"
 
     parent_id: Mapped[int | None] = mapped_column(
         BigInteger,
-        ForeignKey("legal_tab.id", ondelete="CASCADE"),
-        nullable=True,
+        ForeignKey("legal_tab.id", ondelete="CASCADE"),  # 删父行时数据库自动删子行
+        nullable=True,  # parent 行自身无父，填 NULL
         index=True,
-    )  # child 行必填：指向本表中其父文档行的 id；parent 行自身为根节点故为 NULL；级联删除保证删父时子块一并清理
+    )  # child 行必填：指向本表父行主键
 
     chunk_index: Mapped[int] = mapped_column(
         Integer,
         default=0,
         nullable=False,
-    )  # 同一父文档下子块序号（0..n）：滑动窗口切分顺序；排查重复内容时可对照
+    )  # 同一父下子块序号；parent 行恒为 0
 
     title: Mapped[str] = mapped_column(
         String(1024),
         default="",
-    )  # 人类可读短标题：离线时常写入页码范围（如「第3-5页」）；检索展示可选
+    )  # 如「第3-5页」摘要标题
 
     content: Mapped[str] = mapped_column(
         Text,
         nullable=False,
-    )  # parent 存较长合并正文；child 存单块切片文本——在线向量检索读 child.content，生成阶段优先取 parent.content
+    )  # parent 存合并长文；child 存短切片
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
         default=datetime.utcnow,
-    )  # 入库时间：区分多次重新导入同一 PDF 时的批次（当前替换策略多为整表重建）
+    )
 
     children: Mapped[list["LegalTab"]] = relationship(
-        "LegalTab",
-        back_populates="parent",
-        foreign_keys="LegalTab.parent_id",
-    )  # ORM 便捷访问：从父行导航到其下所有子行（内存侧构建树，不落库额外字段）
+        "LegalTab",  # 目标类名（字符串避免循环引用解析问题）
+        back_populates="parent",  # 与下方 parent 关系互指
+        foreign_keys="LegalTab.parent_id",  # 本关系用哪一列做外键
+    )  # 从父导航到子列表
 
     parent: Mapped["LegalTab | None"] = relationship(
         "LegalTab",
         back_populates="children",
-        remote_side="LegalTab.id",
+        remote_side="LegalTab.id",  # 指明「父」端是 id 这一侧
         foreign_keys="LegalTab.parent_id",
-    )  # 从子行回溯父行：`pipeline._fetch_parents` 根据子块携带的 parent_id 批量拉父文档全文
+    )  # 从子导航回父
 
 
 class UserTab(Base):
-    """在线用户：一行对应一个浏览器/客户端身份（external_id），与知识库 FAQ 无关。"""
+    """
+    终端用户表：一行对应一个 `user_external_id`（前端 UUID 等）。
+    """
 
     __tablename__ = "users_tab"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)  # 内部主键
     external_id: Mapped[str] = mapped_column(
         String(128),
         nullable=False,
-        unique=True,
+        unique=True,  # 唯一约束：同一 external_id 只能一行
         index=True,
-    )  # 与 ChatRequest.user_external_id 对应；UUID 或业务侧 OpenID 等
+    )  # 与 API 请求体字段对应
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime,
@@ -157,15 +162,17 @@ class UserTab(Base):
     chats: Mapped[list["HisChatTab"]] = relationship(
         "HisChatTab",
         back_populates="user",
-        cascade="all, delete-orphan",
-    )  # 删用户则删除其全部聊天行
+        cascade="all, delete-orphan",  # 删用户时级联删其所有聊天记录
+    )
 
 
 class HisChatTab(Base):
-    """用户聊天历史：每轮对话一行；查询侧按 user_id + created_at 取最近 N 条。"""
+    """
+    聊天历史表：每轮用户问 + 助手答一行；按 user_id 与 created_at 查询最近 N 条。
+    """
 
     __tablename__ = "his_chat_tab"
-    __table_args__ = (Index("ix_his_chat_user_created", "user_id", "created_at"),)
+    __table_args__ = (Index("ix_his_chat_user_created", "user_id", "created_at"),)  # 复合索引加速「某用户最近记录」
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(
@@ -173,9 +180,9 @@ class HisChatTab(Base):
         ForeignKey("users_tab.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
-    )  # 指向 users_tab.id
-    question: Mapped[str] = mapped_column(Text, nullable=False)  # 用户本轮原始问题全文（截断由 service 写入时限制）
-    answer: Mapped[str] = mapped_column(Text, nullable=False)  # 助手 SSE 拼接后的完整回复
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    )  # 外键指向 users_tab.id
+    question: Mapped[str] = mapped_column(Text, nullable=False)  # 用户本轮问题（落库时可能截断）
+    answer: Mapped[str] = mapped_column(Text, nullable=False)  # 助手完整回复（SSE 拼接后）
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)  # 时间序排序用
 
-    user: Mapped["UserTab"] = relationship("UserTab", back_populates="chats")
+    user: Mapped["UserTab"] = relationship("UserTab", back_populates="chats")  # 多对一：多行聊天属于一个用户

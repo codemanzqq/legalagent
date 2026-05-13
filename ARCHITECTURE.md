@@ -16,7 +16,7 @@ Legal_System/                        # 本仓库根目录
 │
 ├── backend/                          # HTTP API 层（FastAPI），与领域逻辑解耦
 │   └── app/
-│       ├── main.py                   # FastAPI 应用：CORS、/health、挂载 /api；启动前剥离终端代理环境变量
+│       ├── main.py                   # FastAPI 应用：CORS、/health、挂载 /api
 │       ├── lifespan.py               # 启动：异步建表、Milvus ensure；可选后台循环 MySQL→Milvus 全量同步
 │       ├── deps.py                   # get_pipeline：RagPipeline 进程内单例
 │       ├── schemas.py                # ChatRequest（含可选 user_external_id）、HealthResponse
@@ -25,8 +25,7 @@ Legal_System/                        # 本仓库根目录
 │
 ├── modules/                          # 领域模块（可被 offline 脚本与 backend 共用）
 │   ├── core/
-│   │   ├── config.py                 # 全局 Settings（.env）；阈值、模型路径、Milvus/Redis 等
-│   │   └── strip_proxy_env.py        # 清除代理环境变量，避免本地代理干扰内网/云服务
+│   │   └── config.py                 # 全局 Settings（.env）；阈值、模型路径、Milvus/Redis 等
 │   ├── database/
 │   │   ├── models.py                 # ORM：faq_tab、legal_tab、users_tab、his_chat_tab 等
 │   │   └── session.py                # 异步引擎与会话工厂
@@ -85,8 +84,3 @@ Legal_System/                        # 本仓库根目录
         └── styles.css                # 主题与页面样式
 ```
 
-## 数据流（摘要）
-
-1. **离线**：`data/` → MySQL（`faq_tab` / `legal_tab`）→（可选）Milvus 集合（如 FAQ / 法律子块）。  
-2. **在线**：用户问题 → Redis 缓存 → **可选记忆**（带 `user_external_id` 且命中自述历史类问题则读 `his_chat_tab`）→ 意图 / 混合检索 → LLM 流式回答 → SSE 结束后写入 `his_chat_tab`（需 `user_external_id`）。  
-3. **隔离**：未传 `user_external_id` 或未命中历史类问题时，不读 `his_chat_tab`，行为等同纯 RAG。

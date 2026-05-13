@@ -1,76 +1,88 @@
+# =============================================================================
+# 教学说明：本文件在整体链路中的位置
+# -----------------------------------------------------------------------------
+# 输入：用户问题字符串 `question`；可选 `user_external_id`（前端 UUID，用于缓存隔离与记忆）。
+# 输出：异步生成器 `AsyncIterator[str]`，按时间顺序 yield 小文本片段，供 SSE 逐块推送。
+# 被谁调用：`backend/app/api/chat.py` 中 `pipeline.stream_chat(...)`；通过 `deps.get_pipeline` 单例注入。
+# 数据流摘要：Redis 命中 → 否则（已登录）组装记忆摘要 → 意图模型分流 → FAQ 向量 / 法律混合检索
+#           →（可选）CrossEncoder 重排 → LangChain 流式 LLM；FAQ 极高相似度时直出不走 LLM。
+# 注意：`his_chat_tab` 写入不在本类，而在 API 层 `persist_user_turn`。
+# =============================================================================
 """
-在线 RAG 主链路（与架构设计对齐的执行顺序）：
-
-Redis 缓存 → **已登录则先读** `his_chat_tab` 最近 10 条作记忆上下文（与闲聊/专业无关）→ 意图分流 → 专业路径走 Milvus + RAG；所有 **LLM** 调用均带该记忆块（FAQ 直出无 LLM，除外）。
-
-持久化一轮对话由 API 层 `persist_user_turn` 完成，不在本类内写入 his_chat_tab。
+在线 RAG 主链路：Redis → 记忆摘要 → 意图 → Milvus FAQ / 法律混合检索 → LLM 流式输出。
 """
 
-from __future__ import annotations  # PEP 563：注解延迟求值
+from __future__ import annotations  # 允许类体内前向引用尚未定义的类名（本文件主要用 AsyncIterator 等）
 
-import asyncio  # 异步 IO：to_thread 调用同步 pymilvus / sentence_transformers
-import logging  # 日志记录
-import re  # 正则：轻量分词用于 BM25
-from collections.abc import AsyncIterator  # 异步迭代返回类型
+import asyncio  # 提供 to_thread：把 pymilvus 同步 search 放到线程池，避免阻塞事件循环
+import logging  # 本模块如需打日志可用 logger（当前逻辑以 yield 为主，日志较少）
+import re  # 正则 findall：把中英文粗切成 token，供 BM25Okapi 使用
+from collections.abc import AsyncIterator  # 类型注解：async def stream_chat 的返回类型「异步迭代器」
 
-from langchain_core.messages import AIMessageChunk, HumanMessage, SystemMessage  # LangChain 消息类型
-from langchain_openai import ChatOpenAI  # OpenAI 兼容客户端（对接 DashScope）
-from pymilvus import Collection  # Milvus ORM：集合搜索
-from sqlalchemy import select  # SQLAlchemy Core：构造 SELECT
+from langchain_core.messages import AIMessageChunk, HumanMessage, SystemMessage  # 三种消息：系统/人类/流式 AI 块
+from langchain_openai import ChatOpenAI  # 兼容 OpenAI API 的聊天客户端，本项目指向 DashScope base_url
+from pymilvus import Collection  # 绑定集合名并调用 search/load 的高层类
+from sqlalchemy import select  # 构造 SELECT ORM 查询，用于按 id 批量拉父文档
 
-from modules.cache.redis_client import RedisCache, cache_key_for_query, get_redis  # Redis：缓存与 key 生成
-from modules.core.config import ASSISTANT_NAME, get_settings  # 助手名与全局配置
-from modules.database.models import LegalTab  # 法律父文档 ORM 模型
-from modules.database.session import get_session_factory  # 异步会话工厂
-from modules.embeddings.local_embedding import LocalEmbeddingService  # 本地句向量编码
-from modules.milvus_store.client import ensure_milvus  # 确保 Milvus 连接存在
-from modules.milvus_store.collections import COLLECTION_FAQ, COLLECTION_LEGAL_CHILD  # 集合名称常量
-from modules.rag.dashscope_http import get_dashscope_async_client, get_dashscope_sync_client  # 直连 DashScope 的 httpx 客户端
-from modules.rag.hybrid_rrf import reciprocal_rank_fusion  # 多路排序 RRF 融合
+from modules.cache.redis_client import RedisCache, cache_key_for_query, get_redis  # 问答缓存封装与 key 规则
+from modules.core.config import ASSISTANT_NAME, get_settings  # 兜底文案里的助手名 + 全站配置
+from modules.database.models import LegalTab  # 只查法律父行（doc_role=parent 的长正文）
+from modules.database.session import get_session_factory  # 创建 AsyncSession 的工厂（单例）
+from modules.embeddings.local_embedding import LocalEmbeddingService  # BGE-M3 异步句向量
+from modules.milvus_store.client import ensure_milvus  # 在线程闭包里调用，保证已 connect
+from modules.milvus_store.collections import COLLECTION_FAQ, COLLECTION_LEGAL_CHILD  # 两个集合名字符串常量
+from modules.rag.dashscope_http import get_dashscope_async_client, get_dashscope_sync_client  # 注入 ChatOpenAI 的 httpx
+from modules.rag.hybrid_rrf import reciprocal_rank_fusion  # 稠密排序 + BM25 排序 多路融合
 from modules.memory.service import (
-    DEFAULT_MEMORY_CONTEXT_LINES,
-    fetch_recent_chat_lines,
-    format_chat_history_for_prompt,
-    resolve_user_id,
+    DEFAULT_MEMORY_CONTEXT_LINES,  # 默认取最近几条 his_chat（与 fetch 的 limit 一致）
+    fetch_recent_chat_lines,  # 异步读库：最近 N 条 ORM 行
+    format_chat_history_for_prompt,  # 把行转成可读多行字符串，塞进 HumanMessage
+    resolve_user_id,  # external_id → users_tab.id，没有则插入再 flush
 )
-from modules.rag.intent import is_professional_query  # 意图：是否进入专业检索链路
+from modules.rag.intent import is_professional_query  # 异步：是否走专业检索（否则闲聊引导）
 from modules.rag.prompts import (
-    GUIDE_NON_PROFESSIONAL,
-    RAG_SYSTEM,
-    augment_question_with_memory,
-    build_user_message,
+    GUIDE_NON_PROFESSIONAL,  # 非专业问题的系统提示
+    RAG_SYSTEM,  # 专业 RAG 系统提示
+    augment_question_with_memory,  # 把记忆摘要拼到用户问题后
+    build_user_message,  # 把问题 + 参考资料片段拼成一条 Human 正文
 )
 
-logger = logging.getLogger(__name__)  # 本模块日志器
+logger = logging.getLogger(__name__)  # 模块 logger，级别继承根 logging 配置
 
 
 def _tokenize(text: str) -> list[str]:
-    """将中英文粗切成 token 序列；无 jieba 依赖，便于离线环境部署。"""
-    return re.findall(r"[\u4e00-\u9fff]|[a-zA-Z]+|[0-9]+", text.lower())  # 汉字连续串、英文单词、数字
+    """
+    BM25 需要「分词后的 token 列表」；这里不用 jieba，用正则粗切中文连续字、英文单词、数字。
+    """
+    return re.findall(r"[\u4e00-\u9fff]|[a-zA-Z]+|[0-9]+", text.lower())  # \u4e00-\u9fff 为常用汉字 Unicode 范围；英文转小写降低大小写噪声
 
 
 def _entity_to_dict(entity) -> dict:
-    """将 pymilvus Hit.entity 转为 dict，兼容 dict / 带 to_dict 的对象等形态。"""
-    if entity is None:  # 无实体字段
-        return {}
-    if isinstance(entity, dict):  # 已是字典
-        return entity
-    if hasattr(entity, "to_dict"):  # ORM 风格对象
+    """
+    Milvus Hit.entity 在不同版本可能是 dict 或 Row-like：统一成 dict 方便 `.get`。
+    """
+    if entity is None:  # 某些命中无标量字段
+        return {}  # 空 dict 表示无附加字段
+    if isinstance(entity, dict):  # 已是 Python dict
+        return entity  # 直接返回
+    if hasattr(entity, "to_dict"):  #  duck typing：有 to_dict 就调用
         return entity.to_dict()  # type: ignore[no-any-return]
     try:
-        return dict(entity)  # type: ignore[arg-type]  # 尝试映射转换
-    except Exception:  # noqa: BLE001  # 兜底避免检索链路中断
-        return {}
+        return dict(entity)  # type: ignore[arg-type]  # 尝试强转
+    except Exception:  # noqa: BLE001
+        return {}  # 任何失败都降级为空 dict，不中断检索
 
 
 def _parse_milvus_hits(raw_hits) -> list[tuple[int, float, dict]]:
-    """把 pymilvus SearchResult 解析为 (主键 id, 分数/距离, 标量字段字典) 列表。"""
-    out: list[tuple[int, float, dict]] = []  # 累加器
-    if not raw_hits or not raw_hits[0]:  # 空结果
-        return out
-    for hit in raw_hits[0]:  # 取第一个查询向量的命中列表
-        ent = _entity_to_dict(getattr(hit, "entity", None))  # 取出动态字段
-        out.append((int(hit.id), float(hit.distance), ent))  # COSINE 时 distance 实为相似度，越大越好
+    """
+    pymilvus search 返回 SearchResult：第 0 维对应 batch 中第 1 个查询（本代码每次只查 1 个向量）。
+    """
+    out: list[tuple[int, float, dict]] = []  # 结构化后的列表
+    if not raw_hits or not raw_hits[0]:  # 无结果或第一查询无 hits
+        return out  # 空列表
+    for hit in raw_hits[0]:  # 遍历 Hit 对象
+        ent = _entity_to_dict(getattr(hit, "entity", None))  # hit.entity 为动态字段容器
+        out.append((int(hit.id), float(hit.distance), ent))  # id 主键；distance 在 COSINE 下为相似度
     return out
 
 

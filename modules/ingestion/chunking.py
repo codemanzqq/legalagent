@@ -1,27 +1,37 @@
+# =============================================================================
+# 教学说明：本文件在整体链路中的位置
+# -----------------------------------------------------------------------------
+# 输入：PDF 每页文本列表 `page_texts`；父块内长字符串 `parent_text`。
+# 输出：`ParentChunk` 列表（合并页后的父文档）；`ChildChunk` 列表（滑动窗口子切片）。
+# 被谁调用：`mysql_loaders.load_legal_pdfs_to_mysql`（先父后子写入 ORM）。
+# =============================================================================
 """
-父子分块策略：法律 PDF 先合并为「父块」（较长上下文），再在父文本上滑动窗口得到「子块」。
+父子二段式：Milvus 只索引子块（短、语义集中）；命中子块后用 parent_id 拉父文档全文做重排与生成。
 
-在线流程：向量检索命中子块 → 用 parent_id 换父文档全文参与重排与生成。
+`normalize_ws` 减少空白噪声，有利于 BM25 与向量稳定性。
 """
 
 from __future__ import annotations
 
-import re  # 正则压缩空白
-from dataclasses import dataclass  # 不可变数据结构描述切块
+import re  # 正则替换空白
+from dataclasses import dataclass  # 轻量不可变数据结构
 
 
 def normalize_ws(text: str) -> str:
-    """统一换行与空格，减少噪声提高 BM25 与向量稳定性。"""
-    text = text.replace("\r\n", "\n").replace("\r", "\n")  # 换行符统一
-    text = re.sub(r"[ \t]+", " ", text)  # 连续空格压成单空格
-    text = re.sub(r"\n{3,}", "\n\n", text)  # 过多空行压缩为双换行
-    return text.strip()
+    """
+    把各种换行统一为 \\n，压空格，压过多空行，最后 strip。
+    """
+    text = text.replace("\r\n", "\n").replace("\r", "\n")  # Windows / 老 Mac 换行统一到 LF
+    text = re.sub(r"[ \t]+", " ", text)  # 连续空格或 Tab 变成一个空格
+    text = re.sub(r"\n{3,}", "\n\n", text)  # 3 个以上换行压成两个（保留段落感）
+    return text.strip()  # 去掉首尾空白
 
 
 @dataclass(frozen=True)
 class ParentChunk:
-    """父级聚合块：携带标题摘要、正文与起始页号（用于追溯）。"""
-
+    """
+    一个父块：展示标题（常含页码范围）、合并正文、起始页号。
+    """
     title: str
     text: str
     page_no: int
@@ -29,56 +39,63 @@ class ParentChunk:
 
 @dataclass(frozen=True)
 class ChildChunk:
-    """子级检索块：隶属于某个父块索引下的滑动窗口切片。"""
-
+    """
+    一个子块：属于第几个父块（parent_index）、块内序号、切片文本。
+    """
     parent_index: int
     chunk_index: int
     text: str
 
 
 def chunk_pdf_pages_to_parents(page_texts: list[str], max_chars: int = 1800) -> list[ParentChunk]:
-    """按页缓冲合并：总长超过 max_chars 时 flush 为一个父块；标题标注页范围。"""
-    parents: list[ParentChunk] = []
-    buf: list[str] = []  # 当前聚合中的页文本片段
-    buf_pages: list[int] = []  # 对应页码（从 1 起）
-    buf_len = 0  # 字符计数用于粗估体积
+    """
+    按页往后读，缓冲区内总长不超过 max_chars 就继续合并；超过则 flush 成一个 ParentChunk。
+
+    极端下单个父块仍过长时，再按 2*max_chars 硬切多段（少见）。
+    """
+    parents: list[ParentChunk] = []  # 输出列表
+    buf: list[str] = []  # 当前正在攒的页文本
+    buf_pages: list[int] = []  # 与 buf 一一对应的页码（从 1 开始）
+    buf_len = 0  # 粗略字符总数，用于快速判断是否超 max_chars
 
     def flush() -> None:
-        """把缓冲区写成 ParentChunk 并清空缓冲区。"""
-        nonlocal buf, buf_pages, buf_len
-        if not buf:
+        """
+        把 buf 合成一个 ParentChunk 追加到 parents，然后清空 buf。
+        """
+        nonlocal buf, buf_pages, buf_len  # 声明要改外层函数的变量
+        if not buf:  # 没有内容不必写
             return
-        merged = normalize_ws("\n".join(buf))
-        title = f"第{buf_pages[0]}-{buf_pages[-1]}页" if len(set(buf_pages)) > 1 else f"第{buf_pages[0]}页"
-        parents.append(ParentChunk(title=title, text=merged, page_no=buf_pages[0]))
-        buf, buf_pages, buf_len = [], [], 0
+        merged = normalize_ws("\n".join(buf))  # 多页用换行拼接再规范化
+        title = f"第{buf_pages[0]}-{buf_pages[-1]}页" if len(set(buf_pages)) > 1 else f"第{buf_pages[0]}页"  # 单页/多页标题不同
+        parents.append(ParentChunk(title=title, text=merged, page_no=buf_pages[0]))  # page_no 取该父块起始页
+        buf, buf_pages, buf_len = [], [], 0  # 重置缓冲区
 
-    for i, pg in enumerate(page_texts, start=1):  # i 为页码
-        t = normalize_ws(pg)
-        if not t:
+    for i, pg in enumerate(page_texts, start=1):  # i 为 1-based 页码
+        t = normalize_ws(pg)  # 先规范化单页
+        if not t:  # 空白页跳过
             continue
-        if buf_len + len(t) > max_chars and buf:  # 再加当前页会超长且缓冲区非空
-            flush()
-        buf.append(t)
-        buf_pages.append(i)
-        buf_len += len(t)
-    flush()
+        if buf_len + len(t) > max_chars and buf:  # 加上当前页会超且缓冲区已有内容
+            flush()  # 先落盘已有缓冲，再接收新页
+        buf.append(t)  # 把当前页文本放入缓冲
+        buf_pages.append(i)  # 记录页码
+        buf_len += len(t)  # 更新长度计数
+    flush()  # 文件末尾把剩余缓冲写出
 
-    split_parents: list[ParentChunk] = []
-    for p in parents:  # 极端超长父块再硬切（少见）
-        if len(p.text) <= max_chars * 2:
-            split_parents.append(p)
-            continue
-        start = 0
-        part = 0
-        while start < len(p.text):
-            piece = p.text[start : start + max_chars * 2]
+    split_parents: list[ParentChunk] = []  # 二次处理：超宽父块硬切
+    for p in parents:  # 遍历初筛后的每个父块
+        if len(p.text) <= max_chars * 2:  # 未超过两倍阈值：认为可接受
+            split_parents.append(p)  # 原样保留
+            continue  # 下一父块
+        start = 0  # 硬切起点字符偏移
+        part = 0  # 切片序号，拼进标题区分
+        while start < len(p.text):  # 直到覆盖全文
+            piece = p.text[start : start + max_chars * 2]  # 取一段固定长度子串
             split_parents.append(
-                ParentChunk(title=f"{p.title}-{part}", text=piece, page_no=p.page_no),
+                ParentChunk(title=f"{p.title}-{part}", text=piece, page_no=p.page_no),  # 标题加后缀
             )
-            start += max_chars * 2
-            part += 1
-    return split_parents or parents
+            start += max_chars * 2  # 下一段起点
+            part += 1  # 序号递增
+    return split_parents or parents  # 若 split_parents 为空（理论上不应发生）回退 parents
 
 
 def split_children_from_parent(
@@ -87,21 +104,25 @@ def split_children_from_parent(
     child_chars: int = 512,
     overlap: int = 128,
 ) -> list[ChildChunk]:
-    """滑动窗口：步长 = child_chars - overlap；过短父文本整段为单个子块。"""
-    t = normalize_ws(parent_text)
-    if not t:
-        return []
-    if len(t) <= child_chars:
-        return [ChildChunk(parent_index=parent_index, chunk_index=0, text=t)]
+    """
+    滑动窗口：窗口长 child_chars，每次向前移动 step = child_chars - overlap。
 
-    children: list[ChildChunk] = []
-    step = max(child_chars - overlap, 1)  # 至少前进 1 字符避免死循环
-    idx = 0
-    pos = 0
-    while pos < len(t):
-        piece = t[pos : pos + child_chars]
-        if piece.strip():
-            children.append(ChildChunk(parent_index=parent_index, chunk_index=idx, text=piece))
-            idx += 1
-        pos += step
+    过短父文本不滑窗，整段作为一个子块。
+    """
+    t = normalize_ws(parent_text)  # 先规范化
+    if not t:  # 空父文本
+        return []  # 无子块
+    if len(t) <= child_chars:  # 不需要滑动
+        return [ChildChunk(parent_index=parent_index, chunk_index=0, text=t)]  # 单子块 index=0
+
+    children: list[ChildChunk] = []  # 输出
+    step = max(child_chars - overlap, 1)  # 步长至少 1，否则 while 死循环
+    idx = 0  # 子块序号从 0 递增
+    pos = 0  # 窗口左端在父串中的位置
+    while pos < len(t):  # 直到窗口起点越过末尾
+        piece = t[pos : pos + child_chars]  # 切片，可能最后一段不足 child_chars
+        if piece.strip():  # 全空白切片不要
+            children.append(ChildChunk(parent_index=parent_index, chunk_index=idx, text=piece))  # 记录一块
+            idx += 1  # 下一块序号
+        pos += step  # 窗口右移
     return children

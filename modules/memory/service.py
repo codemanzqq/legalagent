@@ -1,7 +1,14 @@
+# =============================================================================
+# 教学说明：本文件在整体链路中的位置
+# -----------------------------------------------------------------------------
+# 输入：`AsyncSession` + `external_id` / `user_id`；或 SSE 结束后的 `question`/`answer` 文本。
+# 输出：`resolve_user_id` 返回 int；`fetch_recent_chat_lines` 返回 ORM 行列表；`persist_user_turn` 无返回（落库）。
+# 被谁调用：`pipeline.stream_chat`（只读+commit）；`api/chat.py` 的 `persist_user_turn`（写 his_chat）。
+# =============================================================================
 """
-用户与聊天历史的数据访问：解析外部用户标识、按时间拉取最近记录、持久化一轮问答。
+用户与聊天历史的数据访问层：与 `users_tab` / `his_chat_tab` 表一一对应。
 
-注意：`persist_user_turn` 在独立会话内 `commit`；`resolve_user_id` 仅 `flush`，由调用方 `commit`。
+`resolve_user_id` 故意不 commit，便于与同一 session 内其它查询共事务。
 """
 
 from __future__ import annotations
@@ -11,28 +18,26 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from modules.database.models import HisChatTab, UserTab
 
-# 注入模型上下文的默认条数（与 pipeline 中 fetch_recent_chat_lines 的 limit 一致）
-DEFAULT_MEMORY_CONTEXT_LINES = 10
+DEFAULT_MEMORY_CONTEXT_LINES = 10  # 与 pipeline 里 fetch_recent_chat_lines 的 limit 一致
 
 
 async def resolve_user_id(session: AsyncSession, external_id: str) -> int:
     """
-    根据前端传入的 external_id 返回 `users_tab.id`。
+    SELECT users_tab by external_id；无则 INSERT 一行并 flush 得到自增 id。
 
-    - 已存在：直接返回主键。
-    - 不存在：插入一行后 `flush` 拿 id；**不**在本函数内 commit，便于与同一事务内的查询组合。
+    不在此 commit：调用方负责 commit（pipeline 在读完记忆后 commit 一次）。
     """
-    ext = external_id.strip()
-    if not ext:
+    ext = external_id.strip()  # 去空白
+    if not ext:  # 空串非法
         raise ValueError("external_id empty")
-    res = await session.execute(select(UserTab).where(UserTab.external_id == ext))
-    row = res.scalar_one_or_none()
-    if row is not None:
-        return int(row.id)
-    u = UserTab(external_id=ext)
-    session.add(u)
-    await session.flush()  # 生成自增 id，供尚未 commit 时的外键使用
-    return int(u.id)
+    res = await session.execute(select(UserTab).where(UserTab.external_id == ext))  # 异步查询
+    row = res.scalar_one_or_none()  # 0 行 None，多行会抛异常（unique 约束下不应发生）
+    if row is not None:  # 已注册过
+        return int(row.id)  # 返回内部主键
+    u = UserTab(external_id=ext)  # 新建 ORM 对象
+    session.add(u)  # 挂到 session
+    await session.flush()  # 发 INSERT 并回填 u.id，但不结束事务
+    return int(u.id)  # 新用户 id
 
 
 async def fetch_recent_chat_lines(
@@ -41,56 +46,55 @@ async def fetch_recent_chat_lines(
     limit: int = DEFAULT_MEMORY_CONTEXT_LINES,
 ) -> list[HisChatTab]:
     """
-    读取某用户最近 `limit` 条聊天行（默认 5 条，供模型作短期记忆上下文）。
+    ORDER BY created_at DESC LIMIT n，再在 Python 里 reverse，使列表按时间正序（旧→新）。
 
-    SQL 按 `created_at DESC`；返回前 **reverse** 成时间正序，便于 Prompt 中「从早到晚」叙述。
+    正序便于 Prompt 里写「从早到晚」。
     """
     res = await session.execute(
         select(HisChatTab)
-        .where(HisChatTab.user_id == user_id)
-        .order_by(HisChatTab.created_at.desc())
-        .limit(limit),
+        .where(HisChatTab.user_id == user_id)  # 只查该用户
+        .order_by(HisChatTab.created_at.desc())  # 新的在前
+        .limit(limit),  # 最多 n 条
     )
-    rows = list(res.scalars().all())
-    rows.reverse()
+    rows = list(res.scalars().all())  # materialize
+    rows.reverse()  # 原地反转为时间升序
     return rows
 
 
 def format_chat_history_for_prompt(rows: list[HisChatTab]) -> str:
     """
-    将 ORM 行转为纯文本块；供 `prompts.augment_question_with_memory` 拼入用户消息。
+    无记录时返回固定提示句；有记录则格式化为「序号. 用户问：… 助手答：…」多行文本。
 
-    单行过长时截断 question/answer，防止极端长文本撑爆上下文。
+    对超长 question/answer 做截断，避免撑爆模型上下文。
     """
-    if not rows:
+    if not rows:  # 新用户从未对话
         return "（当前尚无已存储的聊天记录。）"
     lines: list[str] = []
-    for i, r in enumerate(rows, start=1):
-        q = (r.question or "").replace("\n", " ").strip()[:2000]
+    for i, r in enumerate(rows, start=1):  # 展示序号从 1 起
+        q = (r.question or "").replace("\n", " ").strip()[:2000]  # 换行压空格，限制长度
         a = (r.answer or "").replace("\n", " ").strip()[:4000]
-        lines.append(f"{i}. 用户问：{q}\n   助手答：{a}")
-    return "\n".join(lines)
+        lines.append(f"{i}. 用户问：{q}\n   助手答：{a}")  # 两行一条记录，缩进对齐助手行
+    return "\n".join(lines)  # 单个大字符串
 
 
 async def persist_user_turn(external_id: str | None, question: str, answer: str) -> None:
     """
-    SSE 整轮成功后调用：插入 `his_chat_tab`。
+    独立开 session：INSERT his_chat_tab 一行并 commit。
 
-    - 无 external_id、空回答：直接返回（不落库）。
-    - 使用独立 session + 单次 commit，与管线内只读会话隔离。
+    无 external_id 或空答案则 no-op，避免写入无意义行。
     """
-    if not external_id or not external_id.strip() or not (answer or "").strip():
-        return  # 无用户标识或空答案不落库，避免脏数据
-    from modules.database.session import get_session_factory  # 延迟导入，减少 import 环依赖风险
+    if not external_id or not external_id.strip() or not (answer or "").strip():  # 任一条件不满足
+        return  # 直接返回，不发 SQL
+    from modules.database.session import get_session_factory  # 函数内导入，避免循环 import
 
     factory = get_session_factory()
-    async with factory() as session:  # 独立事务：与管线内只读 session 分离
-        uid = await resolve_user_id(session, external_id.strip())  # 确保 users_tab 有对应行
+    async with factory() as session:  # 新会话 = 新事务，与 pipeline 内 session 隔离
+        uid = await resolve_user_id(session, external_id.strip())  # 确保 users 表有主键
         session.add(
             HisChatTab(
-                user_id=uid,
-                question=question[:8000],  # 与 ChatRequest.message 上限对齐
-                answer=answer[:65000],  # TEXT 足够大，仍截断防止异常超长
+                user_id=uid,  # 外键
+                question=question[:8000],  # 与 API 校验上限对齐
+                answer=answer[:65000],  # 极长 SSE 拼接仍留余量
             ),
         )
-        await session.commit()  # 立即持久化，供后续「自述历史」查询
+        await session.commit()  # 立即可被后续 fetch_recent_chat_lines 读到

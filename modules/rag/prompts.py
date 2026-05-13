@@ -1,11 +1,18 @@
+# =============================================================================
+# 教学说明：本文件在整体链路中的位置
+# -----------------------------------------------------------------------------
+# 输入：用户问题、参考资料字符串列表、可选记忆摘要；常量 `ASSISTANT_NAME` 来自 config。
+# 输出：拼好的多行字符串，作为 `HumanMessage.content` 或系统提示片段。
+# 被谁调用：`pipeline._stream_simple_llm` / `_rag_stream_llm` 传入 LangChain 消息列表。
+# =============================================================================
 """
-系统提示词与用户消息拼装：控制助手人设、RAG 约束及参考资料排版。
+集中管理「人设 + 引用纪律 + 记忆块格式」，避免在 pipeline 里散落长 f-string。
 
-- `build_user_message` / `augment_question_with_memory`：已登录用户默认附带最近若干条库内问答摘要，
-  供模型结合上下文作答（含与往期对话相关的追问）（见「启动与部署.md」记忆章节）。
+`GUIDE_NON_PROFESSIONAL`：用户被意图模型判为非专业时使用。
+`RAG_SYSTEM`：走知识库检索时使用。
 """
 
-from modules.core.config import ASSISTANT_NAME  # 助手名称占位符
+from modules.core.config import ASSISTANT_NAME  # 与 config 中常量一致，改一处全局生效
 
 GUIDE_NON_PROFESSIONAL = f"""你是「{ASSISTANT_NAME}」，一位严谨、友好的法律与税务知识助手。
 当前用户的问题不属于专业知识范畴或与税法/劳动法等场景无关。
@@ -23,25 +30,31 @@ RAG_SYSTEM = f"""你是「{ASSISTANT_NAME}」，一位面向中国用户的法�
 
 def augment_question_with_memory(question: str, memory_snippet: str | None) -> str:
     """
-    已登录用户每次请求都会附带库内格式化的最近若干轮问答；匿名用户传 None 则原样返回 question。
+    若 `memory_snippet` 为 None 或空，原样返回 `question`；否则在问题后追加固定格式的历史块。
+
+    记忆块由 `memory.service.format_chat_history_for_prompt` 生成。
     """
-    if not memory_snippet:
-        return question
+    if not memory_snippet:  # 匿名用户或未查到历史
+        return question  # 不修改原问题
     return (
         f"{question}\n\n"
         "【以下为该用户在系统中的最近若干条问答记录（按时间从早到晚），本轮回复均可作为上下文参考（含闲聊引导与专业作答）。"
         "若用户询问与往期对话相关的内容请据实依据记录；勿编造记录中不存在的内容。】\n"
         f"{memory_snippet}"
-    )
+    )  # 一大段字符串，整体作为「用户侧语义」进入模型
 
 
 def build_user_message(question: str, contexts: list[str], memory_snippet: str | None = None) -> str:
-    """把用户问题（可含记忆块）与参考资料片段格式化为单条 Human 消息正文。"""
-    q = augment_question_with_memory(question, memory_snippet)  # 可能附加「最近聊天记录」块
-    blocks = "\n\n".join(f"[片段{i+1}]\n{c}" for i, c in enumerate(contexts))  # 编号的 RAG 上下文
+    """
+    把「用户问题（可含记忆）」与「编号参考资料」拼成单条 Human 消息，供 RAG 主模型消费。
+
+    `contexts` 已是父文档全文或 FAQ 参考片段列表。
+    """
+    q = augment_question_with_memory(question, memory_snippet)  # 先合并记忆
+    blocks = "\n\n".join(f"[片段{i+1}]\n{c}" for i, c in enumerate(contexts))  # enumerate 从 0 开始故显示 i+1
     return (
         f"用户问题：{q}\n\n"
         "作答提示：若参考资料中已有可直接回答该问题的原文或条文，请优先忠实引用该部分，"
         "避免冗长铺垫与过度归纳；仅在必要时用一两句话补充。\n\n"
         f"参考资料：\n{blocks}"
-    )  # 单条 HumanMessage.content，由 pipeline._rag_stream_llm 传给 ChatOpenAI
+    )  # 返回 str，外层包装为 HumanMessage(content=...)

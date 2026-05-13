@@ -1,15 +1,24 @@
+# =============================================================================
+# 教学说明：本文件在整体链路中的位置
+# -----------------------------------------------------------------------------
+# 输入：无（`get_pipeline` 无参）；依赖进程内首次调用时的构造副作用（加载大模型）。
+# 输出：单例 `RagPipeline` 实例，供 FastAPI `Depends` 注入到路由处理函数。
+# 被谁调用：`backend/app/api/chat.py` 中 `pipeline: RagPipeline = Depends(get_pipeline)`。
+# =============================================================================
 """
-依赖注入：为路由函数提供「进程级单例」的 RAG 管线实例。
+FastAPI 依赖注入：把「重对象」与「请求处理函数参数」解耦。
 
-Embedding / Rerank 模型占用内存大，复用同一 `RagPipeline` 可避免重复加载。
+`lru_cache` 保证全进程一个 `RagPipeline`，避免每请求 new 一次导致显存爆炸。
 """
 
-from functools import lru_cache  # 进程内缓存工厂函数结果，实现单例效果
+from functools import lru_cache  # 标准库单例装饰器
 
-from modules.rag.pipeline import RagPipeline  # 端到端检索增强生成管线
+from modules.rag.pipeline import RagPipeline  # 管线定义在 modules 层，backend 只组装
 
 
-@lru_cache  # 首次调用时构造，之后始终返回同一实例
+@lru_cache  # 无括号等价 maxsize=None：缓存任意多次调用中「唯一」无参调用结果
 def get_pipeline() -> RagPipeline:
-    """FastAPI `Depends(get_pipeline)` 使用的提供者。"""
-    return RagPipeline()  # 构造管线（内部再懒加载向量模型与重排模型）
+    """
+    FastAPI 解析 Depends(get_pipeline) 时：第一次请求调用本函数，之后直接返回缓存实例。
+    """
+    return RagPipeline()  # 构造：内部会 new LocalEmbeddingService 等
