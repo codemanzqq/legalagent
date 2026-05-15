@@ -20,5 +20,10 @@ from modules.rag.pipeline import RagPipeline  # 管线定义在 modules 层，ba
 def get_pipeline() -> RagPipeline:
     """
     FastAPI 解析 Depends(get_pipeline) 时：第一次请求调用本函数，之后直接返回缓存实例。
+
+    入参:
+        无。
+    返回:
+        进程内单例 `RagPipeline`。
     """
     return RagPipeline()  # 构造：内部会 new LocalEmbeddingService 等

@@ -20,6 +20,11 @@ from dataclasses import dataclass  # 轻量不可变数据结构
 def normalize_ws(text: str) -> str:
     """
     把各种换行统一为 \\n，压空格，压过多空行，最后 strip。
+
+    入参:
+        text: 任意原始字符串（可含 \\r\\n、多余空格与空行）。
+    返回:
+        规范化后的单行/多行文本字符串；首尾空白已去除。
     """
     text = text.replace("\r\n", "\n").replace("\r", "\n")  # Windows / 老 Mac 换行统一到 LF
     text = re.sub(r"[ \t]+", " ", text)  # 连续空格或 Tab 变成一个空格
@@ -31,6 +36,11 @@ def normalize_ws(text: str) -> str:
 class ParentChunk:
     """
     一个父块：展示标题（常含页码范围）、合并正文、起始页号。
+
+    属性（dataclass 字段）:
+        title: 父块标题，如单页或跨页页码摘要。
+        text: 合并、规范化后的父文档正文。
+        page_no: 该父块在原文中的起始页码（1-based）。
     """
     title: str
     text: str
@@ -41,6 +51,11 @@ class ParentChunk:
 class ChildChunk:
     """
     一个子块：属于第几个父块（parent_index）、块内序号、切片文本。
+
+    属性（dataclass 字段）:
+        parent_index: 所属父块在父块列表中的下标（从 0 起，与入库 enumerate 对齐）。
+        chunk_index: 同一父块内子片的序号（从 0 起）。
+        text: 子块切片文本（已做空白规范化）。
     """
     parent_index: int
     chunk_index: int
@@ -52,6 +67,12 @@ def chunk_pdf_pages_to_parents(page_texts: list[str], max_chars: int = 1800) -> 
     按页往后读，缓冲区内总长不超过 max_chars 就继续合并；超过则 flush 成一个 ParentChunk。
 
     极端下单个父块仍过长时，再按 2*max_chars 硬切多段（少见）。
+
+    入参:
+        page_texts: 按页顺序排列的文本列表，下标 0 对应第 1 页内容。
+        max_chars: 单个父块目标最大字符数；合并缓冲超过该值会切分新父块。
+    返回:
+        `ParentChunk` 列表；若发生二次硬切则返回切分后的列表，否则为合并结果。
     """
     parents: list[ParentChunk] = []  # 输出列表
     buf: list[str] = []  # 当前正在攒的页文本
@@ -61,6 +82,11 @@ def chunk_pdf_pages_to_parents(page_texts: list[str], max_chars: int = 1800) -> 
     def flush() -> None:
         """
         把 buf 合成一个 ParentChunk 追加到 parents，然后清空 buf。
+
+        入参:
+            无（通过闭包读写外层 parents、buf、buf_pages、buf_len）。
+        返回:
+            无；副作用为向 parents 追加元素并清空缓冲。
         """
         nonlocal buf, buf_pages, buf_len  # 声明要改外层函数的变量
         if not buf:  # 没有内容不必写
@@ -108,6 +134,14 @@ def split_children_from_parent(
     滑动窗口：窗口长 child_chars，每次向前移动 step = child_chars - overlap。
 
     过短父文本不滑窗，整段作为一个子块。
+
+    入参:
+        parent_text: 父文档全文（将先经空白规范化）。
+        parent_index: 该父块在父块列表中的下标，写入每个子块的 parent_index。
+        child_chars: 子块窗口长度（字符数）。
+        overlap: 相邻窗口重叠长度；步长为 max(child_chars - overlap, 1)。
+    返回:
+        `ChildChunk` 列表；父文本为空则返回空列表；极短文本则仅含一个子块。
     """
     t = normalize_ws(parent_text)  # 先规范化
     if not t:  # 空父文本

@@ -36,6 +36,11 @@ _HISTORY_PATTERNS: tuple[re.Pattern[str], ...] = (
 def is_self_history_question(text: str) -> bool:
     """
     任一条正则 `search` 命中则 True；过短字符串直接 False 减少噪声。
+
+    入参:
+        text: 用户当前自然语言问题。
+    返回:
+        True 表示句式像在询问自身聊天/历史记录；False 表示不按自述历史处理。
     """
     s = text.strip()  # 去首尾空白
     if len(s) < 2:  # 单字符几乎不可能是完整自述历史问句

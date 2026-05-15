@@ -29,6 +29,14 @@ logger = logging.getLogger("milvus_sync")
 
 
 async def _main() -> None:
+    """
+    单入口协程：仅触发 Milvus 全量同步任务。
+
+    入参:
+        无。
+    返回:
+        无；通过日志输出 `run_sync_job` 返回的统计 dict。
+    """
     stats = await run_sync_job()  # recreate=True 全量删表重建（见 milvus_sync 实现）
     logger.info("result: %s", stats)
 

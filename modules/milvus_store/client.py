@@ -31,6 +31,11 @@ def ensure_milvus() -> str:
     若当前进程尚未 connect，则建立 TCP（或 gRPC）连接；已连接则立即返回。
 
     返回值为别名，便于单元测试或日志拼接（本项目中多数调用方忽略返回值）。
+
+    入参:
+        无；主机端口等来自 `get_settings()`。
+    返回:
+        连接别名字符串（常量为 `default`）。
     """
     s = get_settings()  # 配置单例
     addr = f"{s.milvus_host}:{s.milvus_port}"  # 人类可读地址串，仅用于日志
@@ -50,6 +55,11 @@ def close_milvus() -> None:
     主动断开 default 连接；单元测试 teardown 或进程退出前可选用。
 
     若从未 connect，`disconnect` 可能抛异常，故用 try/except 吞掉。
+
+    入参:
+        无。
+    返回:
+        无；失败时静默忽略。
     """
     try:  # 尝试断开
         connections.disconnect(_ALIAS)  # 释放与 Milvus 的 socket

@@ -33,6 +33,12 @@ def augment_question_with_memory(question: str, memory_snippet: str | None) -> s
     若 `memory_snippet` 为 None 或空，原样返回 `question`；否则在问题后追加固定格式的历史块。
 
     记忆块由 `memory.service.format_chat_history_for_prompt` 生成。
+
+    入参:
+        question: 用户原始问题字符串。
+        memory_snippet: 格式化后的近期对话摘要，可为 None。
+    返回:
+        可能附带历史说明块的完整用户侧文本，供模型作为单条语义输入。
     """
     if not memory_snippet:  # 匿名用户或未查到历史
         return question  # 不修改原问题
@@ -49,6 +55,13 @@ def build_user_message(question: str, contexts: list[str], memory_snippet: str |
     把「用户问题（可含记忆）」与「编号参考资料」拼成单条 Human 消息，供 RAG 主模型消费。
 
     `contexts` 已是父文档全文或 FAQ 参考片段列表。
+
+    入参:
+        question: 用户问题原文。
+        contexts: 参考资料字符串列表，将按 `[片段n]` 编号拼接。
+        memory_snippet: 可选记忆摘要，经 `augment_question_with_memory` 合并进问题部分。
+    返回:
+        单条多段结构的 Prompt 正文（非 Message 对象）。
     """
     q = augment_question_with_memory(question, memory_snippet)  # 先合并记忆
     blocks = "\n\n".join(f"[片段{i+1}]\n{c}" for i, c in enumerate(contexts))  # enumerate 从 0 开始故显示 i+1

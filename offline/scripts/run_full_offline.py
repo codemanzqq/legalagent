@@ -30,6 +30,14 @@ logger = logging.getLogger("full_offline")
 
 
 async def _main() -> None:
+    """
+    单入口协程：先 MySQL 全量导入，再 Milvus 同步。
+
+    入参:
+        无。
+    返回:
+        无；通过日志输出两阶段统计字典。
+    """
     mysql_stats = await run_default_file_ingest()  # 第一步：落 MySQL
     logger.info("mysql: %s", mysql_stats)
     milvus_stats = await run_sync_job()  # 第二步：读 MySQL 写 Milvus

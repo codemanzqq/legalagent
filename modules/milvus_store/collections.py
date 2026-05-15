@@ -29,6 +29,11 @@ COLLECTION_LEGAL_CHILD = "xiaoyi_legal_child"  # 法律子块向量集合名
 def _faq_fields(dim: int) -> list[FieldSchema]:
     """
     定义 FAQ 集合各列：主键 id + 文本冗余字段 + 向量列。
+
+    入参:
+        dim: 向量列 embedding 的维度。
+    返回:
+        Milvus `FieldSchema` 列表，顺序与 insert 列顺序一致。
     """
     return [
         FieldSchema(
@@ -51,6 +56,11 @@ def _faq_fields(dim: int) -> list[FieldSchema]:
 def _legal_child_fields(dim: int) -> list[FieldSchema]:
     """
     法律子块集合：id + 回溯字段 + 文本 + 向量。
+
+    入参:
+        dim: 向量列 embedding 的维度。
+    返回:
+        法律子块集合的 `FieldSchema` 列表。
     """
     return [
         FieldSchema(
@@ -70,6 +80,11 @@ def _legal_child_fields(dim: int) -> list[FieldSchema]:
 def _create_index(collection: Collection) -> None:
     """
     在向量列上建 HNSW 近似最近邻索引；`metric_type` 与 search 时 COSINE 一致。
+
+    入参:
+        collection: 已创建且含 embedding 列的 Milvus 集合。
+    返回:
+        无。
     """
     index = {
         "index_type": "HNSW",  # 分层小世界图，检索快
@@ -82,6 +97,11 @@ def _create_index(collection: Collection) -> None:
 def _drop_if_exists(name: str) -> None:
     """
     若集合存在则物理删除（数据清空）；用于全量重建前清理。
+
+    入参:
+        name: Milvus 集合名字符串。
+    返回:
+        无；删除成功时打 INFO 日志。
     """
     if utility.has_collection(name):  # 布尔：是否存在该名的 collection
         utility.drop_collection(name)  # 删除元数据与数据文件（视 Milvus 版本与存储而定）
@@ -91,6 +111,11 @@ def _drop_if_exists(name: str) -> None:
 def create_collections_if_not_exist(dim: int) -> None:
     """
     幂等：集合已存在则 `load` 进内存；不存在则建 schema、建索引、load。
+
+    入参:
+        dim: 向量维度，与 FAQ/法律子块两套集合共用。
+    返回:
+        无。
     """
     ensure_milvus()  # 无连接则先连
     for name, fields_fn in (
@@ -114,6 +139,11 @@ def create_collections_if_not_exist(dim: int) -> None:
 def recreate_collections(dim: int) -> None:
     """
     破坏性操作：先删两个集合再调用 `create_collections_if_not_exist`，保证与当前代码 schema 一致。
+
+    入参:
+        dim: 向量维度。
+    返回:
+        无。
     """
     ensure_milvus()  # 先连接，否则 utility 无法工作
     _drop_if_exists(COLLECTION_FAQ)  # 删 FAQ 集合

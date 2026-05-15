@@ -19,6 +19,11 @@ from pypdf import PdfReader  # 轻量依赖，按页遍历 Page 对象
 def extract_pages_pdf(path: Path) -> list[str]:
     """
     打开 PDF，顺序遍历每一页，抽取 text；单页异常不中断全书。
+
+    入参:
+        path: PDF 文件的本地路径。
+    返回:
+        长度等于页数的字符串列表；第 i 个元素为第 i+1 页文本，解析失败则为空串。
     """
     reader = PdfReader(str(path))  # pypdf 需要文件路径字符串
     pages: list[str] = []  # 累加每页结果

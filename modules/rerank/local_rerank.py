@@ -30,6 +30,11 @@ logger = logging.getLogger(__name__)
 def _make_cross_encoder() -> CrossEncoder:
     """
     从本地目录加载 CrossEncoder 权重；设备与 embedding 共用 EMBEDDING_DEVICE。
+
+    入参:
+        无；路径与设备来自 `get_settings()`。
+    返回:
+        可用于 `predict` 的 `CrossEncoder` 实例。
     """
     settings = get_settings()
     root = Path(__file__).resolve().parents[2]  # 仓库根
@@ -45,17 +50,39 @@ class LocalRerankService:
     """
 
     def __init__(self) -> None:
+        """
+        构造重排服务并加载 CrossEncoder 模型。
+
+        入参:
+            无。
+        返回:
+            无。
+        """
         self._model = _make_cross_encoder()  # 初始化即加载模型
 
     async def rank(self, query: str, passages: Sequence[str]) -> list[float]:
         """
         返回每个 passage 的相关性分数；passages 为空则返回空列表。
+
+        入参:
+            query: 用户问题。
+            passages: 待打分的父文档全文等段落序列。
+        返回:
+            与 `passages` 等长的浮点分列表，分数越高表示越相关；空输入时返回 []。
         """
         if not passages:  # 无父文档可排
             return []  # 避免 predict 收到空输入
         pairs = [(query, p) for p in passages]  # CrossEncoder 输入：N 个二元组列表
 
         def _run() -> list[float]:
+            """
+            在线程池中执行的同步打分闭包。
+
+            入参:
+                无（使用外层 `pairs` 与 `self._model`）。
+            返回:
+                各 passage 的 Python float 分数列表。
+            """
             scores = self._model.predict(list(pairs))  # numpy 或 tensor 转成的数组-like
             return [float(s) for s in scores]  # 统一为 Python float，便于 sorted / zip
 

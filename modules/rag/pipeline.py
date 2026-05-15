@@ -53,6 +53,11 @@ logger = logging.getLogger(__name__)  # 模块 logger，级别继承根 logging 
 def _tokenize(text: str) -> list[str]:
     """
     BM25 需要「分词后的 token 列表」；这里不用 jieba，用正则粗切中文连续字、英文单词、数字。
+
+    入参:
+        text: 待分词的原始字符串（一般为子块正文或用户问题）。
+    返回:
+        token 字符串列表；英文已转小写。
     """
     return re.findall(r"[\u4e00-\u9fff]|[a-zA-Z]+|[0-9]+", text.lower())  # \u4e00-\u9fff 为常用汉字 Unicode 范围；英文转小写降低大小写噪声
 
@@ -60,6 +65,11 @@ def _tokenize(text: str) -> list[str]:
 def _entity_to_dict(entity) -> dict:
     """
     Milvus Hit.entity 在不同版本可能是 dict 或 Row-like：统一成 dict 方便 `.get`。
+
+    入参:
+        entity: Milvus 命中行的标量字段容器，可为 dict、带 to_dict 的对象或其它可转换类型。
+    返回:
+        Python `dict`；无法解析时返回空字典。
     """
     if entity is None:  # 某些命中无标量字段
         return {}  # 空 dict 表示无附加字段
@@ -76,6 +86,11 @@ def _entity_to_dict(entity) -> dict:
 def _parse_milvus_hits(raw_hits) -> list[tuple[int, float, dict]]:
     """
     pymilvus search 返回 SearchResult：第 0 维对应 batch 中第 1 个查询（本代码每次只查 1 个向量）。
+
+    入参:
+        raw_hits: `Collection.search` 的原始返回（含 batch 维）。
+    返回:
+        `(命中主键 id, 距离/相似度, 标量字段 dict)` 的列表；无命中时为空列表。
     """
     out: list[tuple[int, float, dict]] = []  # 结构化后的列表
     if not raw_hits or not raw_hits[0]:  # 无结果或第一查询无 hits
@@ -90,13 +105,27 @@ class RagPipeline:
     """封装端到端异步 RAG；建议每个 worker 进程只实例化一次（依赖注入单例）。"""
 
     def __init__(self) -> None:
+        """
+        构造 RAG 管线，挂载配置、嵌入服务与 Redis 缓存。
+
+        入参:
+            无。
+        返回:
+            无；CrossEncoder 懒加载于首次法律重排。
+        """
         self.settings = get_settings()  # 读取配置单例
         self._emb = LocalEmbeddingService()  # 句向量服务（懒加载底层模型在首次使用时）
         self._rerank = None  # CrossEncoder 较重，首次法律检索时再加载
         self._cache = RedisCache(get_redis())  # 异步 Redis 缓存封装
 
     def _llm(self) -> ChatOpenAI:
-        """构造带流式与自定义 httpx 客户端的 ChatOpenAI（DashScope OpenAI 兼容）。"""
+        """构造带流式与自定义 httpx 客户端的 ChatOpenAI（DashScope OpenAI 兼容）。
+
+        入参:
+            无（使用 `self.settings`）。
+        返回:
+            已开启 `streaming=True` 的 `ChatOpenAI` 实例。
+        """
         s = self.settings  # 缩短引用
         return ChatOpenAI(
             model=s.llm_model,  # 如 qwen-max
@@ -110,7 +139,13 @@ class RagPipeline:
         )
 
     def _reranker(self):
-        """懒加载本地重排模型，避免 FAQ 直达路径也加载 CrossEncoder。"""
+        """懒加载本地重排模型，避免 FAQ 直达路径也加载 CrossEncoder。
+
+        入参:
+            无。
+        返回:
+            `LocalRerankService` 单例（挂在 `self._rerank` 上）。
+        """
         if self._rerank is None:  # 尚未初始化
             from modules.rerank.local_rerank import LocalRerankService  # 延迟导入减轻冷启动
 
@@ -124,10 +159,25 @@ class RagPipeline:
         limit: int,
         output_fields: list[str],
     ):
-        """在线程中执行 pymilvus Collection.search，避免阻塞 asyncio 事件循环。"""
+        """在线程中执行 pymilvus Collection.search，避免阻塞 asyncio 事件循环。
+
+        入参:
+            collection: Milvus 集合名字符串。
+            vector: 单条查询向量（与集合 dim 一致）。
+            limit: Top-K 返回条数。
+            output_fields: 需要随命中一并返回的标量字段名列表。
+        返回:
+            `Collection.search` 的原始结果对象，结构与 pymilvus 版本一致。
+        """
 
         def _run():
-            """同步 Milvus 检索闭包。"""
+            """同步 Milvus 检索闭包。
+
+            入参:
+                无（使用外层 collection、vector、limit、output_fields）。
+            返回:
+                同步 `search` 调用的返回值。
+            """
             ensure_milvus()  # 在线进程必须显式连接
             col = Collection(collection)  # 绑定集合
             col.load()  # 加载段到内存
@@ -142,7 +192,13 @@ class RagPipeline:
         return await asyncio.to_thread(_run)  # 线程池执行同步 pymilvus API
 
     async def _fetch_parents(self, ids: list[int]) -> dict[int, str]:
-        """按父文档主键批量查询 MySQL，返回 id → 正文（截断防止超长上下文）。"""
+        """按父文档主键批量查询 MySQL，返回 id → 正文（截断防止超长上下文）。
+
+        入参:
+            ids: 父文档主键列表（`legal_tab` 中 doc_role=parent 的 id）。
+        返回:
+            字典：键为父 id，值为正文子串（至多约 8000 字符）；`ids` 为空时返回 {}。
+        """
         if not ids:  # 无 id 则跳过数据库
             return {}
         factory = get_session_factory()  # 会话工厂单例
@@ -162,6 +218,12 @@ class RagPipeline:
         分支顺序：缓存 →（已登录）加载最近 10 条库内问答作记忆 → 意图闲聊或专业 → FAQ / 法律检索 / 兜底（凡调用 LLM 均附带同一记忆块）。
 
         匿名不传 `user_external_id` 时不查 `his_chat_tab`，记忆块为空。
+
+        入参:
+            question: 用户自然语言问题。
+            user_external_id: 可选；非空时解析用户并加载近期聊天记忆、参与缓存 key。
+        返回:
+            异步迭代器，按时间顺序产出助手回复的字符串片段（供 SSE 拼接）。
         """
         # ----- ① Redis：完全相同 scope（用户+问题）命中则直接返回答案，跳过后续检索与 LLM -----
         scope = f"{(user_external_id or '').strip()}:{question}"  # 匿名用户 external_id 为空串，仍可与问题组成 key
@@ -329,7 +391,16 @@ class RagPipeline:
         memory_snippet: str | None = None,
         user_external_id: str | None = None,
     ) -> AsyncIterator[str]:
-        """使用 RAG 系统提示词与拼装后的参考资料进行流式生成，并在结束后写入缓存。"""
+        """使用 RAG 系统提示词与拼装后的参考资料进行流式生成，并在结束后写入缓存。
+
+        入参:
+            question: 用户问题原文。
+            contexts: 已进入 Prompt 的参考资料片段列表（父文档或 FAQ 拼块）。
+            memory_snippet: 可选近期对话格式串。
+            user_external_id: 可选，用于拼缓存 key 与区分用户。
+        返回:
+            异步迭代器，逐片产出模型生成文本；结束后将完整答案写入 Redis（route=rag_llm）。
+        """
         scope = f"{(user_external_id or '').strip()}:{question}"
         key = cache_key_for_query(scope)
         llm = self._llm()  # 每次调用新建 ChatOpenAI（内部 httpx 客户端仍单例）
@@ -349,7 +420,13 @@ class RagPipeline:
         )  # 仅带参考资料生成的路径写 Redis，便于重复提问命中
 
     async def _stream_simple_llm(self, messages: list) -> AsyncIterator[str]:
-        """不使用参考资料时的通用流式生成（意图引导、无命中兜底等）；默认不写长期缓存。"""
+        """不使用参考资料时的通用流式生成（意图引导、无命中兜底等）；默认不写长期缓存。
+
+        入参:
+            messages: LangChain 消息列表（SystemMessage / HumanMessage 等）。
+        返回:
+            异步迭代器，逐片产出模型文本；本路径刻意不写与专业问答共享的缓存 key。
+        """
         llm = self._llm()
         buf: list[str] = []
         async for chunk in llm.astream(messages):

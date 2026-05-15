@@ -88,6 +88,11 @@ class Settings(BaseSettings):
     def mysql_dsn_async(self) -> str:
         """
         SQLAlchemy 异步 URL：协议头必须是 mysql+aiomysql，后面跟用户名密码主机库名。
+
+        入参:
+            无（读取当前 `Settings` 实例字段）。
+        返回:
+            `mysql+aiomysql://...` 形式的异步数据库连接 URL 字符串。
         """
         return (
             f"mysql+aiomysql://{self.mysql_user}:{self.mysql_password}"  # 用户名密码中的特殊字符需 URL 编码（此处未编码，密码勿含 @ 等）
@@ -98,6 +103,11 @@ class Settings(BaseSettings):
     def effective_hot_update_interval_seconds(self) -> int:
         """
         若用户把间隔配成 0 或负数，这里统一回退 60 秒，避免 while 忙等打满 CPU。
+
+        入参:
+            无。
+        返回:
+            实际使用的热更新间隔秒数（正整数）。
         """
         if self.hot_update_interval_seconds <= 0:  # 非法或非正间隔
             return 60  # 安全默认值：每分钟最多全量同步一次
@@ -106,6 +116,11 @@ class Settings(BaseSettings):
     def cors_origin_list(self) -> list[str]:
         """
         CORSMiddleware 需要 Python 列表；把逗号分隔字符串拆成去空格后的列表。
+
+        入参:
+            无。
+        返回:
+            非空的 Origin 字符串列表，供 CORS 白名单使用。
         """
         return [x.strip() for x in self.cors_origins.split(",") if x.strip()]  # 过滤空段，避免白名单里出现 ""
 
@@ -115,6 +130,12 @@ class Settings(BaseSettings):
     def positive_thresh(cls, v: float) -> float:
         """
         阈值在业务上表示「与完全匹配的偏差」，不允许负数，否则相似度换算会乱。
+
+        入参:
+            cls: Pydantic 校验器约定的类对象。
+            v: 待校验的阈值原始浮点值。
+        返回:
+            校验通过后的同一浮点值；若 v<0 则抛出 ValueError。
         """
         if v < 0:  # 负数无物理意义
             raise ValueError("threshold must be non-negative")  # 启动时直接失败，强迫修正 .env
@@ -125,6 +146,11 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """
     全项目统一入口：第一次调用时构造 Settings()，之后永远返回同一对象实例。
+
+    入参:
+        无。
+    返回:
+        进程内缓存的 `Settings` 单例。
     """
     return Settings()  # 触发 pydantic 从环境变量 + .env 填充字段
 

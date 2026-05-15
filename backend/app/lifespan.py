@@ -32,6 +32,11 @@ logger = logging.getLogger(__name__)
 async def _ensure_tables() -> None:
     """
     `Base.metadata.create_all`：已存在的表不会删数据，只补缺失表（开发友好）。
+
+    入参:
+        无。
+    返回:
+        无。
     """
     engine = get_async_engine()
     async with engine.begin() as conn:  # begin 自动事务
@@ -41,6 +46,11 @@ async def _ensure_tables() -> None:
 async def _ensure_milvus() -> None:
     """
     `ensure_milvus` 为同步阻塞：用 to_thread 避免阻塞 asyncio 启动阶段其它协程。
+
+    入参:
+        无。
+    返回:
+        无。
     """
     await asyncio.to_thread(ensure_milvus)
 
@@ -50,6 +60,11 @@ async def _hot_update_loop(stop: asyncio.Event) -> None:
     循环：每 `interval` 秒或被 `stop` 唤醒；超时则尝试 `run_sync_job()`。
 
     `stop.wait()` 与 `wait_for` 结合：既支持定时又支持优雅退出。
+
+    入参:
+        stop: 应用关闭时 set 的事件，用于打断循环。
+    返回:
+        无；内部异常会记录日志不向外抛。
     """
     settings = get_settings()
     interval = float(settings.effective_hot_update_interval_seconds)
@@ -75,6 +90,11 @@ async def app_lifespan(app: FastAPI) -> AsyncIterator[None]:
     FastAPI 约定：`yield` 之前是 startup，`yield` 之后是 shutdown（在 finally 语义里）。
 
     `yield` 的值类型此处为 `None`，表示不向上下文块传递对象。
+
+    入参:
+        app: FastAPI 应用实例（当前实现未直接使用，保留签名兼容框架）。
+    返回:
+        异步上下文管理器；`yield` 后进入请求处理阶段，`finally` 中取消热更新任务。
     """
     await _ensure_tables()
     await _ensure_milvus()

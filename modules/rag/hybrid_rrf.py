@@ -25,6 +25,12 @@ def reciprocal_rank_fusion(
     `ranked_lists` 例如 `[[3,1,5],[5,3,7]]`：第一路认为 3 最相关，第二路认为 5 最相关。
 
     返回列表按融合分从高到低排序，便于 `fused[:30]` 截断。
+
+    入参:
+        ranked_lists: 多路检索结果，每路为按相关性从高到低排列的文档 id 列表。
+        k: RRF 公式中的平滑常数（越大高名次权重衰减越慢）。
+    返回:
+        `(文档 id, 融合得分)` 元组列表，得分降序排列。
     """
     scores: dict[Hashable, float] = defaultdict(float)  # doc_id -> 当前 RRF 累积分
     for lst in ranked_lists:  # 遍历稠密路、BM25 路等

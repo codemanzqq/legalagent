@@ -30,6 +30,11 @@ def _make_lc_embeddings():
     内部工厂：首次调用时才 import langchain_huggingface，加快「只跑 DB 脚本」的冷启动。
 
     返回 LangChain 的 Embeddings 实例（带本地模型目录）。
+
+    入参:
+        无。
+    返回:
+        配置好本地路径与设备的 `HuggingFaceEmbeddings` 实例。
     """
     from langchain_huggingface import HuggingFaceEmbeddings  # 延迟导入：避免无 torch 环境 import 失败扩散
 
@@ -54,12 +59,24 @@ class LocalEmbeddingService:
     """
 
     def __init__(self) -> None:
-        self._emb = _make_lc_embeddings()  # 构造时加载模型权重到内存/GPU（较重）
+        """
+        构造本地嵌入服务，内部加载句向量模型。
 
+        入参:
+            无。
+        返回:
+            无。
+        """
+        self._emb = _make_lc_embeddings()  # 构造时加载模型权重到内存/GPU（较重）
     @property
     def dimension(self) -> int:
         """
         对任意短句编码一次，用返回向量长度作为 Milvus dim；避免手写 1024/768 与模型不一致。
+
+        入参:
+            无。
+        返回:
+            整数，表示模型输出的向量维度。
         """
         v = self._emb.embed_query("ping")  # 同步调用；仅启动建表时用，频率低可接受
         return len(v)  # 向量维度 = 列表长度
@@ -67,12 +84,22 @@ class LocalEmbeddingService:
     async def embed_query(self, text: str) -> list[float]:
         """
         单条文本 → 向量；在线主路径每个用户问题调用一次。
+
+        入参:
+            text: 待编码的单条字符串。
+        返回:
+            与模型维度一致的 `float` 列表（句向量）。
         """
         return await asyncio.to_thread(self._emb.embed_query, text)  # 在线程池执行同步方法，主线程继续调度其它协程
 
     async def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
         """
         多条文本 → 向量列表；顺序与输入 texts 严格一致，供 Milvus insert 对齐。
+
+        入参:
+            texts: 待批量编码的文本序列；空序列时直接返回空列表。
+        返回:
+            与 `texts` 等长的向量列表，每项为 `list[float]`。
         """
         if not texts:  # 空列表：避免底层收到 [] 行为未定义
             return []  # 约定返回空列表

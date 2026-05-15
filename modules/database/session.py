@@ -25,6 +25,11 @@ from modules.core.config import get_settings  # 读取 DSN 与各配置
 def get_async_engine() -> AsyncEngine:
     """
     创建（或返回已缓存的）异步引擎：底层用 aiomysql 驱动。
+
+    入参:
+        无；DSN 来自 `get_settings().mysql_dsn_async`。
+    返回:
+        全局缓存的 `AsyncEngine` 实例。
     """
     settings = get_settings()  # 单例配置
     return create_async_engine(
@@ -42,5 +47,10 @@ def get_session_factory() -> async_sessionmaker[AsyncSession]:
     返回绑定到上面引擎的「会话工厂」：`async with factory() as session:` 获取会话。
 
     `expire_on_commit=False`：commit 之后内存里的 ORM 对象属性仍可访问，不会被强制过期重查。
+
+    入参:
+        无。
+    返回:
+        配置好的 `async_sessionmaker[AsyncSession]`，用于创建异步会话。
     """
     return async_sessionmaker(get_async_engine(), expire_on_commit=False)  # 第一个参数是引擎；第二个控制提交后对象状态

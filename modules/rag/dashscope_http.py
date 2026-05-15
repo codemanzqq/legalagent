@@ -22,6 +22,11 @@ import httpx  # 底层 HTTP 库，LangChain OpenAI 集成会调用其 request �
 def get_dashscope_sync_client() -> httpx.Client:
     """
     同步 Client：LangChain 部分代码路径仍可能阻塞式调用。
+
+    入参:
+        无。
+    返回:
+        配置了 `trust_env=False` 与超时 120s 的 `httpx.Client` 单例。
     """
     return httpx.Client(trust_env=False, timeout=120.0)  # 120s：生成可能较慢；trust_env=False 见模块头说明
 
@@ -30,5 +35,10 @@ def get_dashscope_sync_client() -> httpx.Client:
 def get_dashscope_async_client() -> httpx.AsyncClient:
     """
     异步 Client：`llm.astream` 等主路径使用。
+
+    入参:
+        无。
+    返回:
+        配置了 `trust_env=False` 与超时 120s 的 `httpx.AsyncClient` 单例。
     """
     return httpx.AsyncClient(trust_env=False, timeout=120.0)  # 与同步版超时一致

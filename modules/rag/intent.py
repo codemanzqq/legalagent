@@ -31,6 +31,11 @@ logger = logging.getLogger(__name__)
 def _intent_llm() -> ChatOpenAI:
     """
     构造专用于意图分类的 ChatOpenAI：低温、短超时，与主生成模型分离。
+
+    入参:
+        无。
+    返回:
+        绑定 DashScope 兼容接口与自定义 httpx 客户端的 `ChatOpenAI` 实例。
     """
     s = get_settings()
     return ChatOpenAI(
@@ -50,6 +55,12 @@ _JSON_FENCE = re.compile(r"\{[^{}]*\}")  # 非贪婪匹配最外层一对花括�
 async def is_professional_query(question: str) -> bool:
     """
     调用意图模型；解析失败返回 True（保守：宁可多检索也不要误杀专业问题）。
+
+    入参:
+        question: 用户本轮自然语言问题。
+    返回:
+        True 表示按「专业税法/劳动法等咨询」处理并走检索；False 表示仅闲聊引导分支。
+        无 API Key 或解析异常时默认 True。
     """
     if not question.strip():  # 全空白
         return False  # 空问题不做检索

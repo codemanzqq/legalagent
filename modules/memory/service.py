@@ -26,6 +26,12 @@ async def resolve_user_id(session: AsyncSession, external_id: str) -> int:
     SELECT users_tab by external_id；无则 INSERT 一行并 flush 得到自增 id。
 
     不在此 commit：调用方负责 commit（pipeline 在读完记忆后 commit 一次）。
+
+    入参:
+        session: 异步 ORM 会话。
+        external_id: 前端传入的用户外部唯一标识（非空字符串）。
+    返回:
+        `users_tab.id` 整型主键；`external_id` 为空时抛出 ValueError。
     """
     ext = external_id.strip()  # 去空白
     if not ext:  # 空串非法
@@ -49,6 +55,13 @@ async def fetch_recent_chat_lines(
     ORDER BY created_at DESC LIMIT n，再在 Python 里 reverse，使列表按时间正序（旧→新）。
 
     正序便于 Prompt 里写「从早到晚」。
+
+    入参:
+        session: 异步 ORM 会话。
+        user_id: `users_tab` 主键。
+        limit: 最多返回的记录条数（默认与管线常量一致）。
+    返回:
+        按时间升序排列的 `HisChatTab` ORM 对象列表。
     """
     res = await session.execute(
         select(HisChatTab)
@@ -66,6 +79,11 @@ def format_chat_history_for_prompt(rows: list[HisChatTab]) -> str:
     无记录时返回固定提示句；有记录则格式化为「序号. 用户问：… 助手答：…」多行文本。
 
     对超长 question/answer 做截断，避免撑爆模型上下文。
+
+    入参:
+        rows: 已按时间排序的聊天记录 ORM 行列表。
+    返回:
+        可直接拼入 Prompt 的多行中文说明字符串；无记录时为固定占位句。
     """
     if not rows:  # 新用户从未对话
         return "（当前尚无已存储的聊天记录。）"
@@ -82,6 +100,13 @@ async def persist_user_turn(external_id: str | None, question: str, answer: str)
     独立开 session：INSERT his_chat_tab 一行并 commit。
 
     无 external_id 或空答案则 no-op，避免写入无意义行。
+
+    入参:
+        external_id: 用户外部 id；None 或空白时不写入。
+        question: 用户本轮问题（会按长度截断后入库）。
+        answer: 助手完整回复（会按长度截断后入库）；空白时不写入。
+    返回:
+        无。
     """
     if not external_id or not external_id.strip() or not (answer or "").strip():  # 任一条件不满足
         return  # 直接返回，不发 SQL

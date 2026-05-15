@@ -47,6 +47,11 @@ app.add_middleware(
 async def health() -> HealthResponse:
     """
     GET /health：运维探活；不查数据库，固定返回 ok。
+
+    入参:
+        无。
+    返回:
+        `HealthResponse` 实例（默认 ok=True）。
     """
     return HealthResponse()  # Pydantic 模型默认字段 ok=True
 

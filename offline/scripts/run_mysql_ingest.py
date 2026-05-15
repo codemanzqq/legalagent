@@ -32,6 +32,11 @@ logger = logging.getLogger("mysql_ingest")  # 命名 logger，便于过滤日志
 async def _main() -> None:
     """
     单入口协程：只调用一处业务函数。
+
+    入参:
+        无；依赖仓库根 `data/` 与 `.env` 中 MySQL 配置。
+    返回:
+        无；向日志打印含 `faq_rows`、法律导入计数的统计 dict。
     """
     stats = await run_default_file_ingest()  # 内部：create_all + FAQ + legal
     logger.info("done: %s", stats)  # 打印 dict，含 faq_rows、files、parents、children

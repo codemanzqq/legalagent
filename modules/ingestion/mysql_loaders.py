@@ -37,6 +37,12 @@ DATA_DIR = PROJECT_ROOT / "data"  # 默认 Excel/PDF 所在目录
 def _pick_columns(df: pd.DataFrame) -> tuple[str, str]:
     """
     Excel 表头可能是「问题/答案」或 question/answer 等：本函数返回实际列名字符串二元组。
+
+    入参:
+        df: 已读入的 FAQ 表格，列名在 `df.columns` 中。
+    返回:
+        (问题列名, 答案列名) 二元组，均为 DataFrame 中的真实列名字符串。
+        若无法识别则抛出 ValueError。
     """
     cols = {str(c).strip(): c for c in df.columns}  # 原始列名 → 自身，去首尾空格
     lower = {k.lower(): k for k in cols}  # 小写映射，实现大小写不敏感查找
@@ -44,6 +50,11 @@ def _pick_columns(df: pd.DataFrame) -> tuple[str, str]:
     def find(*names: str) -> str | None:
         """
         按候选名顺序找第一个存在的列名；先精确匹配再小写匹配。
+
+        入参:
+            *names: 若干候选列名字符串，按优先级从前到后尝试。
+        返回:
+            命中的列名字符串；均未命中则返回 None。
         """
         for n in names:  # 遍历候选别名
             if n in cols:  # 精确命中
@@ -71,6 +82,13 @@ async def load_faq_excel_to_mysql(
     pandas 读 xlsx → 遍历行构造 `FaqTab` → `session.add` → `commit`。
 
     `replace_all`：先 `DELETE FROM faq_tab` 再插入，保证幂等全量替换。
+
+    入参:
+        session: 已打开的异步 SQLAlchemy 会话，用于执行删除与插入。
+        xlsx_path: Excel 文件路径（FAQ 表）。
+        replace_all: 为 True 时先清空 `faq_tab` 再导入；False 时仅追加。
+    返回:
+        成功写入（`session.add`）的 FAQ 行数（跳过空行的不计入）。
     """
     df = pd.read_excel(xlsx_path)  # 默认读第一个 sheet
     q_col, a_col = _pick_columns(df)  # 解析表头
@@ -106,6 +124,13 @@ async def load_legal_pdfs_to_mysql(
     遍历目录下 PDF：优先文件名含「税」「劳动」等关键字；若无则导入目录内全部 PDF。
 
     每个 PDF：父行先 `flush` 拿自增 id，再为每个子块写 child 行并外键指向父 id。
+
+    入参:
+        session: 异步会话，用于写入 `legal_tab` 并提交。
+        pdf_dir: PDF 所在目录；为 None 时使用仓库根下默认 `data/`。
+        replace_all: 为 True 时删除 `legal_tab` 全表后再导入（关闭外键检查期间删除）。
+    返回:
+        统计字典，键含 `files`（处理文件数）、`parents`（父行数）、`children`（子行数）。
     """
     root = pdf_dir or DATA_DIR  # 未传参则用默认 data/
     pdfs = sorted(
@@ -177,6 +202,12 @@ async def run_default_file_ingest() -> dict[str, Any]:
     离线一键：create_all 建表 + 默认路径 FAQ + 默认目录 PDF。
 
     在函数内 import 引擎与 Base，避免模块顶层循环 import。
+
+    入参:
+        无。
+    返回:
+        含 `faq_rows` 与法律导入统计（`files`/`parents`/`children` 等）的合并字典。
+        若默认 FAQ 文件不存在则抛出 FileNotFoundError。
     """
     from modules.database.models import Base
     from modules.database.session import get_async_engine, get_session_factory

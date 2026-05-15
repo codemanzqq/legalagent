@@ -38,11 +38,22 @@ async def chat_stream(
     异步生成器 `gen`：迭代 `pipeline.stream_chat`，把每个片段包装成 SSE 行。
 
     依赖注入：`pipeline` 由框架调用 `get_pipeline()` 填入。
+
+    入参:
+        body: 已校验的聊天请求体（message、可选 user_external_id）。
+        pipeline: 注入的 RAG 管线单例。
+    返回:
+        `StreamingResponse`，MIME 为 `text/event-stream`，body 来自内部 `gen()`。
     """
 
     async def gen():
         """
         内部 async generator：不能用普通 def，否则无法 async for。
+
+        入参:
+            无（使用外层 `body` 与 `pipeline`）。
+        返回:
+            异步迭代器，逐项产出 `data: ...\\n\\n` 形式的 SSE 字符串；结束时尝试持久化聊天记录。
         """
         buf: list[str] = []  # 累积所有 yield 的助手片段，最后拼接为 full_answer
         try:
