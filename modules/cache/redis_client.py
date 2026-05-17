@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 class RedisCache:
     """
+    封装 Redis 的 GET/SET 操作，自动处理 JSON 编解码
     薄封装：固定用 JSON 编解码，调用方不用自己 dumps/loads。
     """
 
@@ -41,6 +42,7 @@ class RedisCache:
 
     async def get_json(self, key: str) -> Any | None:
         """
+        从缓存读数据，如果缓存不存在，则返回 None
         await GET key；不存在返回 None；JSON 非法返回 None 并打日志。
 
         入参:
@@ -52,14 +54,15 @@ class RedisCache:
         if raw is None:  # 键不存在
             return None  # 表示未命中缓存
         try:  # 尝试解析
-            return json.loads(raw)  # str → Python 对象（通常是 dict）
+            return json.loads(raw)  # 解析成功，str → Python 对象（通常是 dict）
         except json.JSONDecodeError:  # 值被手工改坏或版本不兼容
             logger.warning("cache corrupt for key=%s", key)  # 便于排查
-            return None  # 当作未命中，避免抛异常打断主链路
+            return None  # 当作未命中，避免抛异常打断主链路,直接走rag逻辑
 
     async def set_json(self, key: str, value: Any, ttl_seconds: int) -> None:
         """
-        SET key value EX ttl；中文用 ensure_ascii=False 保持可读。
+        往缓存存数据，并设置过期时间
+        SET key value EX ttl；中文用 ensure_ascii=False 保持可读，不转义，避免中文乱码。
 
         入参:
             key: Redis 键名。
@@ -82,6 +85,7 @@ def _build_client() -> redis.Redis:
         异步 Redis 客户端单例。
     """
     settings = get_settings()  # 读配置
+    #从 URL 解析出连接参数并创建连接池客户端；进程内只执行一次，创建 Redis 连接池和客户端    
     return redis.from_url(settings.redis_url, decode_responses=True)  # True：bytes 自动 decode 成 str，JSON 友好
 
 
@@ -109,3 +113,31 @@ def cache_key_for_query(q: str) -> str:
         形如 `xiaoyi:rag:qa:<hash>` 的稳定短键字符串。
     """
     return f"xiaoyi:rag:qa:{hash(q.strip())}"  # Python 内置 hash（进程生命周期内稳定；注意多进程不共享）
+
+
+"""
+具体用法举例：
+# 1. 创建缓存实例（全项目共享一个客户端）
+cache = RedisCache(get_redis())
+
+# 2. 生成缓存键（用户ID+问题）
+user_id = "user123"
+question = "什么是Python"
+scope = f"{user_id}:{question}"  # 拼接成 "user123:什么是Python"
+cache_key = cache_key_for_query(scope)  # 生成短键：xiaoyi:rag:qa:<hash>
+
+# 3. 先查缓存
+cached_result = await cache.get_json(cache_key)
+if cached_result:
+    # 缓存命中：直接返回结果给用户
+    return {"answer": cached_result["answer"], "source": "cache"}
+
+# 4. 缓存未命中：走RAG流程生成回答
+rag_answer = await rag_pipeline.run(question)  # 假设这是RAG生成回答的逻辑
+
+# 5. 把结果存入缓存（过期时间1小时）
+await cache.set_json(cache_key, {"answer": rag_answer, "route": "rag"}, ttl_seconds=3600)
+
+# 6. 返回结果给用户
+return {"answer": rag_answer, "source": "rag"}
+"""

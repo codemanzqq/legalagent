@@ -1,316 +1,360 @@
 # =============================================================================
 # 教学说明：本文件在整体链路中的位置
 # -----------------------------------------------------------------------------
-# 输入：用户问题字符串 `question`；可选 `user_external_id`（前端 UUID，用于缓存隔离与记忆）。
-# 输出：异步生成器 `AsyncIterator[str]`，按时间顺序 yield 小文本片段，供 SSE 逐块推送。
-# 被谁调用：`backend/app/api/chat.py` 中 `pipeline.stream_chat(...)`；通过 `deps.get_pipeline` 单例注入。
-# 数据流摘要：Redis 命中 → 否则（已登录）组装记忆摘要 → 意图模型分流 → FAQ 向量 / 法律混合检索
-#           →（可选）CrossEncoder 重排 → LangChain 流式 LLM；FAQ 极高相似度时直出不走 LLM。
-# 注意：`his_chat_tab` 写入不在本类，而在 API 层 `persist_user_turn`。
+# 这是在线问答“总编排文件”：把缓存、记忆、意图、检索、融合、重排、生成串成一条链。
+# 你可以把它理解为“问答总调度器”。
+#
+# 输入：
+# - question：用户本轮问题（字符串）
+# - user_external_id：可选用户标识（用于“用户隔离缓存 + 历史记忆”）
+#
+# 输出：
+# - AsyncIterator[str]：异步文本片段流（供 SSE 逐块输出）
+#
+# 主要调用方：
+# - backend/app/api/chat.py 中的 pipeline.stream_chat(...)
+#
+# 关键特点：
+# - 先缓存短路，再进入复杂链路；
+# - FAQ 高置信可直达，不走大模型；
+# - 法律问题走“向量检索 + BM25 + RRF + 重排 + LLM”。
 # =============================================================================
-"""
-在线 RAG 主链路：Redis → 记忆摘要 → 意图 → Milvus FAQ / 法律混合检索 → LLM 流式输出。
-"""
 
-from __future__ import annotations  # 允许类体内前向引用尚未定义的类名（本文件主要用 AsyncIterator 等）
+"""在线 RAG 主流程（含缓存、记忆、检索、生成）的教学注释版实现。"""
 
-import asyncio  # 提供 to_thread：把 pymilvus 同步 search 放到线程池，避免阻塞事件循环
-import logging  # 本模块如需打日志可用 logger（当前逻辑以 yield 为主，日志较少）
-import re  # 正则 findall：把中英文粗切成 token，供 BM25Okapi 使用
-from collections.abc import AsyncIterator  # 类型注解：async def stream_chat 的返回类型「异步迭代器」
+from __future__ import annotations  # 允许把类型注解延迟求值，避免前向引用问题
 
-from langchain_core.messages import AIMessageChunk, HumanMessage, SystemMessage  # 三种消息：系统/人类/流式 AI 块
-from langchain_openai import ChatOpenAI  # 兼容 OpenAI API 的聊天客户端，本项目指向 DashScope base_url
-from pymilvus import Collection  # 绑定集合名并调用 search/load 的高层类
-from sqlalchemy import select  # 构造 SELECT ORM 查询，用于按 id 批量拉父文档
+import asyncio  # 用于 to_thread：把同步阻塞代码放线程池
+import logging  # 模块日志
+import re  # 正则分词（供 BM25）
+from collections.abc import AsyncIterator  # 标注“异步迭代器”返回类型
+from typing import Any  # 标注动态返回值
 
-from modules.cache.redis_client import RedisCache, cache_key_for_query, get_redis  # 问答缓存封装与 key 规则
-from modules.core.config import ASSISTANT_NAME, get_settings  # 兜底文案里的助手名 + 全站配置
-from modules.database.models import LegalTab  # 只查法律父行（doc_role=parent 的长正文）
-from modules.database.session import get_session_factory  # 创建 AsyncSession 的工厂（单例）
-from modules.embeddings.local_embedding import LocalEmbeddingService  # BGE-M3 异步句向量
-from modules.milvus_store.client import ensure_milvus  # 在线程闭包里调用，保证已 connect
-from modules.milvus_store.collections import COLLECTION_FAQ, COLLECTION_LEGAL_CHILD  # 两个集合名字符串常量
-from modules.rag.dashscope_http import get_dashscope_async_client, get_dashscope_sync_client  # 注入 ChatOpenAI 的 httpx
-from modules.rag.hybrid_rrf import reciprocal_rank_fusion  # 稠密排序 + BM25 排序 多路融合
+from langchain_core.messages import AIMessageChunk, HumanMessage, SystemMessage  # LangChain 消息类型
+from langchain_openai import ChatOpenAI  # OpenAI 兼容客户端（本项目对接 DashScope 兼容接口）
+from pymilvus import Collection  # Milvus 集合对象（load/search/insert）
+from sqlalchemy import select  # SQLAlchemy 查询构造器
+
+from modules.cache.redis_client import RedisCache, cache_key_for_query, get_redis  # Redis 缓存能力
+from modules.core.config import ASSISTANT_NAME, get_settings  # 全局配置 + 助手名称
+from modules.database.models import LegalTab  # 法律文档 ORM 模型（回查父文档用）
+from modules.database.session import get_session_factory  # AsyncSession 工厂
+from modules.embeddings.local_embedding import LocalEmbeddingService  # 向量编码服务
 from modules.memory.service import (
-    DEFAULT_MEMORY_CONTEXT_LINES,  # 默认取最近几条 his_chat（与 fetch 的 limit 一致）
-    fetch_recent_chat_lines,  # 异步读库：最近 N 条 ORM 行
-    format_chat_history_for_prompt,  # 把行转成可读多行字符串，塞进 HumanMessage
-    resolve_user_id,  # external_id → users_tab.id，没有则插入再 flush
+    DEFAULT_MEMORY_CONTEXT_LINES,  # 默认读取的历史条数
+    fetch_recent_chat_lines,  # 读最近历史问答
+    format_chat_history_for_prompt,  # 历史行格式化成 prompt 文本
+    resolve_user_id,  # external_id -> user_id
 )
-from modules.rag.intent import is_professional_query  # 异步：是否走专业检索（否则闲聊引导）
+from modules.milvus_store.client import ensure_milvus  # 确保 Milvus 连接
+from modules.milvus_store.collections import COLLECTION_FAQ, COLLECTION_LEGAL_CHILD  # Milvus 集合名
+from modules.rag.dashscope_http import (
+    get_dashscope_async_client,  # 异步 httpx 客户端
+    get_dashscope_sync_client,  # 同步 httpx 客户端
+)
+from modules.rag.hybrid_rrf import reciprocal_rank_fusion  # RRF 融合算法
+from modules.rag.intent import is_professional_query  # 意图分类（专业/非专业）
 from modules.rag.prompts import (
-    GUIDE_NON_PROFESSIONAL,  # 非专业问题的系统提示
-    RAG_SYSTEM,  # 专业 RAG 系统提示
-    augment_question_with_memory,  # 把记忆摘要拼到用户问题后
-    build_user_message,  # 把问题 + 参考资料片段拼成一条 Human 正文
+    GUIDE_NON_PROFESSIONAL,  # 非专业引导提示词
+    RAG_SYSTEM,  # 专业 RAG 系统提示词
+    augment_question_with_memory,  # 把历史拼到问题里
+    build_user_message,  # 构造最终用户消息
 )
 
-logger = logging.getLogger(__name__)  # 模块 logger，级别继承根 logging 配置
+logger = logging.getLogger(__name__)  # 当前模块 logger
 
 
-def _tokenize(text: str) -> list[str]:
+def _tokenize(text: str) -> list[str]:  # 定义分词函数：把原始文本切成 BM25 可用 token 列表
     """
-    BM25 需要「分词后的 token 列表」；这里不用 jieba，用正则粗切中文连续字、英文单词、数字。
+    把输入文本粗分词（给 BM25 用）。
 
-    入参:
-        text: 待分词的原始字符串（一般为子块正文或用户问题）。
-    返回:
-        token 字符串列表；英文已转小写。
+    参数：
+    - text: 原始文本（可能是用户问题或法律子块文本）
+
+    返回：
+    - list[str]: token 列表（中文单字 + 英文词 + 数字）
     """
-    return re.findall(r"[\u4e00-\u9fff]|[a-zA-Z]+|[0-9]+", text.lower())  # \u4e00-\u9fff 为常用汉字 Unicode 范围；英文转小写降低大小写噪声
+    # text.lower()：统一小写，减少英文大小写差异噪声
+    # 正则说明：
+    # - [\u4e00-\u9fff]：单个中文字符
+    # - [a-zA-Z]+：连续英文单词
+    # - [0-9]+：连续数字
+    return re.findall(r"[\u4e00-\u9fff]|[a-zA-Z]+|[0-9]+", text.lower())  # 返回分词结果列表
 
 
-def _entity_to_dict(entity) -> dict:
+def _entity_to_dict(entity: Any) -> dict:  # 定义实体归一化函数：把不同类型 entity 统一为 dict
     """
-    Milvus Hit.entity 在不同版本可能是 dict 或 Row-like：统一成 dict 方便 `.get`。
+    兼容不同 pymilvus 版本的 entity 结构，统一转成 dict。
 
-    入参:
-        entity: Milvus 命中行的标量字段容器，可为 dict、带 to_dict 的对象或其它可转换类型。
-    返回:
-        Python `dict`；无法解析时返回空字典。
+    参数：
+    - entity: 可能是 dict、Row-like、或带 to_dict 方法的对象
+
+    返回：
+    - dict: 可 .get(...) 的标准字典；失败时返回空字典
     """
-    if entity is None:  # 某些命中无标量字段
-        return {}  # 空 dict 表示无附加字段
-    if isinstance(entity, dict):  # 已是 Python dict
-        return entity  # 直接返回
-    if hasattr(entity, "to_dict"):  #  duck typing：有 to_dict 就调用
-        return entity.to_dict()  # type: ignore[no-any-return]
+    if entity is None:  # 命中无附加字段
+        return {}  # 空实体直接返回空字典
+    if isinstance(entity, dict):  # 已经是 dict
+        return entity  # 已经是字典则原样返回
+    if hasattr(entity, "to_dict"):  # 新版本对象通常有 to_dict
+        return entity.to_dict()  # type: ignore[no-any-return]  # 调用对象自带 to_dict 转换
     try:
-        return dict(entity)  # type: ignore[arg-type]  # 尝试强转
+        return dict(entity)  # 尝试把可迭代键值对对象强制转成 dict
     except Exception:  # noqa: BLE001
-        return {}  # 任何失败都降级为空 dict，不中断检索
+        return {}  # 兜底为空，不影响主流程
 
 
-def _parse_milvus_hits(raw_hits) -> list[tuple[int, float, dict]]:
+def _parse_milvus_hits(raw_hits: Any) -> list[tuple[int, float, dict]]:  # 定义命中解析函数：把 Milvus 原始结果转统一结构
     """
-    pymilvus search 返回 SearchResult：第 0 维对应 batch 中第 1 个查询（本代码每次只查 1 个向量）。
+    解析 Milvus 搜索返回，统一成三元组列表。
 
-    入参:
-        raw_hits: `Collection.search` 的原始返回（含 batch 维）。
-    返回:
-        `(命中主键 id, 距离/相似度, 标量字段 dict)` 的列表；无命中时为空列表。
+    参数：
+    - raw_hits: Collection.search(...) 的原始返回
+
+    返回：
+    - list[(id, distance_or_similarity, entity_dict)]
     """
-    out: list[tuple[int, float, dict]] = []  # 结构化后的列表
-    if not raw_hits or not raw_hits[0]:  # 无结果或第一查询无 hits
-        return out  # 空列表
-    for hit in raw_hits[0]:  # 遍历 Hit 对象
-        ent = _entity_to_dict(getattr(hit, "entity", None))  # hit.entity 为动态字段容器
-        out.append((int(hit.id), float(hit.distance), ent))  # id 主键；distance 在 COSINE 下为相似度
-    return out
+    out: list[tuple[int, float, dict]] = []  # 输出容器
+    if not raw_hits:  # 没有任何结果
+        return out  # 无命中时返回空列表
+    if not raw_hits[0]:  # 第一条查询（本代码每次只查1条）无命中
+        return out  # 第一查询无命中时返回空列表
+
+    for hit in raw_hits[0]:  # 遍历命中列表
+        ent = _entity_to_dict(getattr(hit, "entity", None))  # 规范化 entity
+        out.append((int(hit.id), float(hit.distance), ent))  # 统一类型后写入
+
+    return out  # 返回结构化命中列表
 
 
-class RagPipeline:
-    """封装端到端异步 RAG；建议每个 worker 进程只实例化一次（依赖注入单例）。"""
+class RagPipeline:  # 定义在线问答总编排类：封装缓存、检索、重排、生成全流程
+    """在线问答业务总编排类（建议进程内单例）。"""
 
-    def __init__(self) -> None:
+    def __init__(self) -> None:  # 初始化管线对象，挂载配置/embedding/缓存等组件
         """
-        构造 RAG 管线，挂载配置、嵌入服务与 Redis 缓存。
+        初始化总编排对象。
 
-        入参:
-            无。
-        返回:
-            无；CrossEncoder 懒加载于首次法律重排。
+        成员说明：
+        - self.settings: 全局配置对象
+        - self._emb: 向量编码服务
+        - self._rerank: 重排服务（懒加载）
+        - self._cache: Redis 缓存服务
         """
-        self.settings = get_settings()  # 读取配置单例
-        self._emb = LocalEmbeddingService()  # 句向量服务（懒加载底层模型在首次使用时）
-        self._rerank = None  # CrossEncoder 较重，首次法律检索时再加载
-        self._cache = RedisCache(get_redis())  # 异步 Redis 缓存封装
+        self.settings = get_settings()  # 读取全局配置（单例）
+        self._emb = LocalEmbeddingService()  # 初始化 embedding 服务
+        self._rerank = None  # 暂不加载重排模型，等用到时再加载
+        self._cache = RedisCache(get_redis())  # 初始化缓存封装
 
-    def _llm(self) -> ChatOpenAI:
-        """构造带流式与自定义 httpx 客户端的 ChatOpenAI（DashScope OpenAI 兼容）。
-
-        入参:
-            无（使用 `self.settings`）。
-        返回:
-            已开启 `streaming=True` 的 `ChatOpenAI` 实例。
+    def _llm(self) -> ChatOpenAI:  # 构建并返回一个流式 ChatOpenAI 客户端
         """
-        s = self.settings  # 缩短引用
+        构造一个 LLM 客户端实例（流式）。
+
+        返回：
+        - ChatOpenAI: 已绑定 DashScope 配置 + httpx 客户端
+        """
+        s = self.settings  # 局部变量缩短书写
         return ChatOpenAI(
-            model=s.llm_model,  # 如 qwen-max
-            temperature=0.2,  # 略低以降低胡编概率
-            api_key=s.dashscope_api_key,
-            base_url=s.dashscope_base_url,
-            streaming=True,  # 必须开启以便 astream
-            timeout=120,
-            http_client=get_dashscope_sync_client(),  # 同步调用路径（部分 LangChain 内部使用）
-            http_async_client=get_dashscope_async_client(),  # 异步流式主路径
+            model=s.llm_model,  # 主模型名称（配置项）
+            temperature=0.2,  # 降低随机性，减少胡编
+            api_key=s.dashscope_api_key,  # API Key
+            base_url=s.dashscope_base_url,  # 兼容接口地址
+            streaming=True,  # 打开流式输出（SSE必须）
+            timeout=120,  # 请求超时秒数
+            http_client=get_dashscope_sync_client(),  # 同步客户端
+            http_async_client=get_dashscope_async_client(),  # 异步客户端
         )
 
-    def _reranker(self):
-        """懒加载本地重排模型，避免 FAQ 直达路径也加载 CrossEncoder。
-
-        入参:
-            无。
-        返回:
-            `LocalRerankService` 单例（挂在 `self._rerank` 上）。
+    def _reranker(self):  # 获取重排器：首次调用时懒加载，后续复用
         """
-        if self._rerank is None:  # 尚未初始化
-            from modules.rerank.local_rerank import LocalRerankService  # 延迟导入减轻冷启动
+        懒加载重排模型（仅法律复杂链路会用到）。
 
-            self._rerank = LocalRerankService()
-        return self._rerank
+        返回：
+        - LocalRerankService: 重排服务单例
+        """
+        if self._rerank is None:  # 首次调用才初始化
+            from modules.rerank.local_rerank import LocalRerankService  # 延迟导入，减少冷启动
 
-    async def _milvus_search(
+            self._rerank = LocalRerankService()  # 实例化重排服务
+        return self._rerank  # 返回已初始化对象
+
+    async def _milvus_search(  # 异步检索包装：把同步 pymilvus search 放在线程池执行
         self,
-        collection: str,
-        vector: list[float],
-        limit: int,
-        output_fields: list[str],
-    ):
-        """在线程中执行 pymilvus Collection.search，避免阻塞 asyncio 事件循环。
+        collection: str,  # 要检索的集合名（FAQ或法律子块）
+        vector: list[float],  # 查询向量（单条）
+        limit: int,  # 返回 top-k 条数
+        output_fields: list[str],  # 需要返回的标量字段
+    ) -> Any:
+        """
+        在线程中执行 Milvus 同步检索，避免阻塞 asyncio 事件循环。
 
-        入参:
-            collection: Milvus 集合名字符串。
-            vector: 单条查询向量（与集合 dim 一致）。
-            limit: Top-K 返回条数。
-            output_fields: 需要随命中一并返回的标量字段名列表。
-        返回:
-            `Collection.search` 的原始结果对象，结构与 pymilvus 版本一致。
+        参数：
+        - collection: 集合名
+        - vector: 查询向量
+        - limit: top-k
+        - output_fields: 附带返回的字段
         """
 
-        def _run():
-            """同步 Milvus 检索闭包。
-
-            入参:
-                无（使用外层 collection、vector、limit、output_fields）。
-            返回:
-                同步 `search` 调用的返回值。
-            """
-            ensure_milvus()  # 在线进程必须显式连接
-            col = Collection(collection)  # 绑定集合
-            col.load()  # 加载段到内存
+        def _run() -> Any:  # 定义同步闭包：线程中真正执行 Milvus 检索
+            """同步闭包：真正调用 pymilvus search。"""
+            ensure_milvus()  # 先确保连接存在
+            col = Collection(collection)  # 绑定集合对象
+            col.load()  # 加载到内存，避免 search 失败
             return col.search(
-                data=[vector],  # 单查询向量批
-                anns_field="embedding",  # 向量列名（与建表一致）
-                param={"metric_type": "COSINE", "params": {"ef": 128}},  # HNSW 查询参数 ef
-                limit=limit,  # Top-K
-                output_fields=output_fields,  # 需要返回的标量字段
+                data=[vector],  # 单条查询，包装成 batch 形式
+                anns_field="embedding",  # 向量字段名
+                param={"metric_type": "COSINE", "params": {"ef": 128}},  # 检索参数
+                limit=limit,  # top-k
+                output_fields=output_fields,  # 返回字段
             )
 
-        return await asyncio.to_thread(_run)  # 线程池执行同步 pymilvus API
+        return await asyncio.to_thread(_run)  # 在线程池执行同步检索
 
-    async def _fetch_parents(self, ids: list[int]) -> dict[int, str]:
-        """按父文档主键批量查询 MySQL，返回 id → 正文（截断防止超长上下文）。
-
-        入参:
-            ids: 父文档主键列表（`legal_tab` 中 doc_role=parent 的 id）。
-        返回:
-            字典：键为父 id，值为正文子串（至多约 8000 字符）；`ids` 为空时返回 {}。
+    async def _fetch_parents(self, ids: list[int]) -> dict[int, str]:  # 批量回查父文档：输入 parent_id 列表，输出 id->正文映射
         """
-        if not ids:  # 无 id 则跳过数据库
-            return {}
-        factory = get_session_factory()  # 会话工厂单例
-        async with factory() as session:  # 自动关闭会话
-            res = await session.execute(select(LegalTab).where(LegalTab.id.in_(ids)))  # IN 查询
-            rows = list(res.scalars().all())  # 取出 ORM 对象列表
-        return {r.id: (r.content or "")[:8000] for r in rows}  # 限制单篇最大字符，保护上下文窗口
+        按 parent id 批量回查父文档全文。
 
-    async def stream_chat(
+        参数：
+        - ids: 父文档 id 列表
+
+        返回：
+        - dict[parent_id, parent_text]
+        """
+        if not ids:  # 空输入直接返回空映射
+            return {}
+
+        factory = get_session_factory()  # 取会话工厂
+        async with factory() as session:  # 打开会话
+            res = await session.execute(
+                select(LegalTab).where(LegalTab.id.in_(ids)),  # 按 id in 批量查询
+            )
+            rows = list(res.scalars().all())  # 提取 ORM 列表
+
+        # 保护上下文长度：每篇父文档最多取 8000 字符
+        return {r.id: (r.content or "")[:8000] for r in rows}
+
+    async def stream_chat(  # 在线主入口：按业务链路逐步产出回答分片
         self,
-        question: str,
-        user_external_id: str | None = None,
+        question: str,  # 用户问题（本轮输入）
+        user_external_id: str | None = None,  # 用户外部 ID（用于记忆和缓存隔离）
     ) -> AsyncIterator[str]:
         """
-        统一对外接口：按顺序 yield 字符串片段；调用方（SSE）原样转发。
+        对外主入口：返回异步文本片段流。
 
-        分支顺序：缓存 →（已登录）加载最近 10 条库内问答作记忆 → 意图闲聊或专业 → FAQ / 法律检索 / 兜底（凡调用 LLM 均附带同一记忆块）。
-
-        匿名不传 `user_external_id` 时不查 `his_chat_tab`，记忆块为空。
-
-        入参:
-            question: 用户自然语言问题。
-            user_external_id: 可选；非空时解析用户并加载近期聊天记忆、参与缓存 key。
-        返回:
-            异步迭代器，按时间顺序产出助手回复的字符串片段（供 SSE 拼接）。
+        主流程：
+        1) 查缓存
+        2) 读取用户历史记忆
+        3) 意图分流（非专业走引导）
+        4) 专业链路：FAQ 检索 -> 法律检索 -> 融合 -> 重排 -> 生成
         """
-        # ----- ① Redis：完全相同 scope（用户+问题）命中则直接返回答案，跳过后续检索与 LLM -----
-        scope = f"{(user_external_id or '').strip()}:{question}"  # 匿名用户 external_id 为空串，仍可与问题组成 key
-        key = cache_key_for_query(scope)
-        cached = await self._cache.get_json(key)
-        if isinstance(cached, dict) and cached.get("answer"):
+        # ---------------------------------------------------------------------
+        # 步骤1：缓存短路
+        # ---------------------------------------------------------------------
+        # scope 设计成“用户ID:问题”，确保不同用户同问题不会共享答案缓存
+        scope = f"{(user_external_id or '').strip()}:{question}"
+        key = cache_key_for_query(scope)  # 生成缓存 key
+        cached = await self._cache.get_json(key)  # 读缓存
+        if isinstance(cached, dict) and cached.get("answer"):  # 判断缓存对象合法且包含 answer 字段
+            # 命中缓存：直接输出答案并结束，跳过后续所有链路
             yield str(cached["answer"])
-            return
+            return  # 缓存命中后结束主流程
 
-        # ----- ② 记忆（已登录）：每次生成前统一拉取最近 N 轮问答，闲聊与专业共用；匿名为 None -----
-        memory_snippet: str | None = None
-        if user_external_id and user_external_id.strip():
-            factory = get_session_factory()
-            async with factory() as session:
-                uid = await resolve_user_id(session, user_external_id.strip())
-                rows = await fetch_recent_chat_lines(session, uid, DEFAULT_MEMORY_CONTEXT_LINES)
-                memory_snippet = format_chat_history_for_prompt(rows)
-                await session.commit()
+        # ---------------------------------------------------------------------
+        # 步骤2：用户历史记忆（仅有 user_external_id 时启用）
+        # ---------------------------------------------------------------------
+        memory_snippet: str | None = None  # 默认无记忆
+        if user_external_id and user_external_id.strip():  # 仅在用户ID有效时启用记忆链路
+            factory = get_session_factory()  # 会话工厂
+            async with factory() as session:  # 打开数据库会话
+                uid = await resolve_user_id(session, user_external_id.strip())  # external_id -> user_id
+                rows = await fetch_recent_chat_lines(
+                    session,  # 当前数据库会话（用于查询历史）
+                    uid,  # 当前用户内部主键
+                    DEFAULT_MEMORY_CONTEXT_LINES,  # 最近N条
+                )
+                memory_snippet = format_chat_history_for_prompt(rows)  # 格式化为 prompt 文本
+                await session.commit()  # 提交事务，结束本轮记忆读取会话
 
-        # ----- ③ 意图：非专业 → 闲聊引导（Human 消息同样附带上述记忆块） -----
-        if not await is_professional_query(question):
+        # ---------------------------------------------------------------------
+        # 步骤3：意图分流（非专业 -> 引导）
+        # ---------------------------------------------------------------------
+        if not await is_professional_query(question):  # 意图判定为非专业问题
             async for piece in self._stream_simple_llm(
                 [
-                    SystemMessage(content=GUIDE_NON_PROFESSIONAL),
-                    HumanMessage(content=augment_question_with_memory(question, memory_snippet)),
+                    SystemMessage(content=GUIDE_NON_PROFESSIONAL),  # 系统提示：引导回专业问题
+                    HumanMessage(content=augment_question_with_memory(question, memory_snippet)),  # 人类消息附带记忆
                 ],
             ):
-                yield piece
-            return
+                yield piece  # 逐片返回
+            return  # 非专业路径返回，不进入专业检索
 
-        # ----- ④ 以下进入「专业检索」主路径：先对当前问题编码查询向量 -----
-        qvec = await self._emb.embed_query(question)
+        # ---------------------------------------------------------------------
+        # 步骤4：专业链路先做问题向量化
+        # ---------------------------------------------------------------------
+        qvec = await self._emb.embed_query(question)  # 将用户问题编码为检索向量
 
-        # ----- ⑤ FAQ：Milvus 高频问答集合 Top10；高置信直出无 LLM（不注入记忆）；否则拼 FAQ 进 LLM（带记忆） -----
+        # ---------------------------------------------------------------------
+        # 步骤5：FAQ 检索分支
+        # ---------------------------------------------------------------------
         faq_raw = await self._milvus_search(
-            COLLECTION_FAQ,
-            qvec,
-            limit=10,
-            output_fields=["question", "answer"],
+            COLLECTION_FAQ,  # FAQ 集合
+            qvec,  # 查询向量
+            limit=10,  # 取前10条
+            output_fields=["question", "answer"],  # 返回 question/answer
         )
-        faq_parsed = _parse_milvus_hits(faq_raw)
+        faq_parsed = _parse_milvus_hits(faq_raw)  # 解析命中结果
 
-        th_direct = self.settings.faq_direct_distance_threshold  # 配置：允许的「非相似」比例上界
-        th_llm = self.settings.faq_llm_distance_threshold  # FAQ 多路拼上下文时的相似度门槛
-        # Milvus COSINE：hit.distance 为相似度 ∈[0,1] 左右，越大越相似；阈值换算为最低相似度 = 1 - th
-        sim_direct = 1.0 - th_direct
-        sim_llm = 1.0 - th_llm
+        # 配置阈值：代码里用“相似度阈值”，配置里是“距离阈值”
+        th_direct = self.settings.faq_direct_distance_threshold  # FAQ 直达阈值（距离）
+        th_llm = self.settings.faq_llm_distance_threshold  # FAQ 进入 LLM 阈值（距离）
+        sim_direct = 1.0 - th_direct  # 转相似度阈值
+        sim_llm = 1.0 - th_llm  # 转相似度阈值
 
-        if faq_parsed:  # FAQ 集合有返回（即使分数低）
-            _best_id, best_sim, ent = faq_parsed[0]  # 按相似度排序后的第一条
-            if best_sim >= sim_direct and ent.get("answer"):  # 高置信：直接返回答案文本
-                ans = str(ent["answer"])
+        if faq_parsed:  # FAQ 集合存在命中候选
+            _best_id, best_sim, ent = faq_parsed[0]  # 取最相似的一条 FAQ 命中
+
+            # 5.1 FAQ 高置信：直接输出，不走 LLM
+            if best_sim >= sim_direct and ent.get("answer"):  # 满足高置信阈值且有标准答案
+                ans = str(ent["answer"])  # 标准答案文本
                 await self._cache.set_json(
-                    key,
-                    {"answer": ans, "route": "faq_direct"},
-                    self.settings.cache_ttl_seconds,
+                    key,  # 当前问题缓存 key
+                    {"answer": ans, "route": "faq_direct"},  # 标记为 FAQ 直达路径
+                    self.settings.cache_ttl_seconds,  # 过期时间
                 )
-                for i in range(0, len(ans), 40):  # 人为切块 yield，改善 SSE 首包观感
+                # 为了前端“流式观感”，把长文本分块输出
+                for i in range(0, len(ans), 40):
                     yield ans[i : i + 40]
-                return
+                return  # FAQ 直达输出后结束
 
-            close = [x for x in faq_parsed if x[1] >= sim_llm][: self.settings.faq_top_k_for_llm]  # 过滤 + 截断条数
-            if close and close[0][1] >= sim_llm:  # 至少一条满足中等相似度
-                ctx = []
-                for _, d, e in close:
-                    if e.get("answer"):
-                        ctx.append(f"问答参考（相似度={d:.4f}）：{e['answer']}")  # 拼若干 FAQ 作参考
-                if ctx:
+            # 5.2 FAQ 中等相似：把 FAQ 答案作为上下文交给 LLM
+            close = [x for x in faq_parsed if x[1] >= sim_llm][: self.settings.faq_top_k_for_llm]
+            if close and close[0][1] >= sim_llm:  # 存在可用于 LLM 参考的中等相似 FAQ
+                ctx: list[str] = []  # FAQ 上下文片段容器
+                for _, d, e in close:  # 遍历近似 FAQ，逐条构建参考上下文
+                    if e.get("answer"):  # 只取有答案的项
+                        ctx.append(f"问答参考（相似度={d:.4f}）：{e['answer']}")  # 拼接上下文
+                if ctx:  # 有上下文才调用 LLM
                     async for p in self._rag_stream_llm(
-                        question,
-                        ctx,
-                        memory_snippet=memory_snippet,
-                        user_external_id=user_external_id,
+                        question=question,  # 原问题
+                        contexts=ctx,  # FAQ 参考上下文
+                        memory_snippet=memory_snippet,  # 用户历史
+                        user_external_id=user_external_id,  # 缓存隔离
                     ):
                         yield p
-                    return
+                    return  # FAQ+LLM 路径结束
 
-        # ---------- 法律长文档混合检索分支 ----------
-        dense_limit = self.settings.hybrid_dense_candidate_k  # 向量检索候选数量
+        # ---------------------------------------------------------------------
+        # 步骤6：法律检索分支（FAQ 不足时）
+        # ---------------------------------------------------------------------
+        dense_limit = self.settings.hybrid_dense_candidate_k  # dense 候选数量
         legal_raw = await self._milvus_search(
-            COLLECTION_LEGAL_CHILD,
-            qvec,
-            limit=dense_limit,
-            output_fields=["text", "parent_id", "source_file"],
+            COLLECTION_LEGAL_CHILD,  # 法律子块集合
+            qvec,  # 查询向量
+            limit=dense_limit,  # 候选数量
+            output_fields=["text", "parent_id", "source_file"],  # 取出子块文本和父id
         )
-        legal_parsed = _parse_milvus_hits(legal_raw)
-        if not legal_parsed:  # 向量库无任何子块命中
+        legal_parsed = _parse_milvus_hits(legal_raw)  # 解析结果
+
+        if not legal_parsed:  # 法律子块检索无命中
             async for p in self._stream_simple_llm(
                 [
                     SystemMessage(
@@ -320,117 +364,153 @@ class RagPipeline:
                 ],
             ):
                 yield p
-            return
+            return  # 执行兜底回复后结束
 
-        child_ids = [x[0] for x in legal_parsed]  # 子块 id 列表（与向量检索顺序一致）
-        id_to_text = {x[0]: str(x[2].get("text", "")) for x in legal_parsed}  # id → 子块文本
+        # 把命中结果拆成常用结构
+        child_ids = [x[0] for x in legal_parsed]  # 子块 id 列表
+        id_to_text = {x[0]: str(x[2].get("text", "")) for x in legal_parsed}  # 子块 id -> 子块文本
+        dense_ranked = [x[0] for x in legal_parsed]  # dense 路排序结果
 
-        dense_ranked = [x[0] for x in legal_parsed]  # 稠密检索给出的 doc 顺序
+        # ---------------------------------------------------------------------
+        # 步骤7：可选 BM25 + RRF 融合
+        # ---------------------------------------------------------------------
+        if self.settings.legal_hybrid_bm25_enabled and len(child_ids) > 1:  # 开关开启且候选足够时启用 BM25 融合
+            from rank_bm25 import BM25Okapi  # 延迟导入，减少不必要开销
 
-        if self.settings.legal_hybrid_bm25_enabled and len(child_ids) > 1:  # 开启 BM25 且候选多于 1
-            from rank_bm25 import BM25Okapi  # 延迟导入
-
-            tokenized_corpus = [_tokenize(id_to_text[i]) for i in child_ids]  # 每个子块一篇伪文档
-            tokenized_q = _tokenize(question)  # 查询分词
-            bm25 = BM25Okapi(tokenized_corpus)
-            scores = bm25.get_scores(tokenized_q)  # 每个子块得分
-            bm25_order = [child_ids[i] for i in sorted(range(len(child_ids)), key=lambda k: scores[k], reverse=True)]
-            ranked_lists = [dense_ranked, bm25_order[: self.settings.hybrid_bm25_candidate_k]]  # 两路排序列表
+            tokenized_corpus = [_tokenize(id_to_text[i]) for i in child_ids]  # 子块语料分词
+            tokenized_q = _tokenize(question)  # 问题分词
+            bm25 = BM25Okapi(tokenized_corpus)  # 基于候选语料构建 BM25 打分器
+            scores = bm25.get_scores(tokenized_q)  # 计算查询对每个候选的 BM25 分数
+            bm25_order = [
+                child_ids[i]
+                for i in sorted(
+                    range(len(child_ids)),
+                    key=lambda k: scores[k],  # 按 BM25 分数排序
+                    reverse=True,
+                )
+            ]
+            ranked_lists = [
+                dense_ranked,  # dense 排序
+                bm25_order[: self.settings.hybrid_bm25_candidate_k],  # BM25 截断排序
+            ]
         else:
-            ranked_lists = [dense_ranked]  # 仅稠密一路
+            ranked_lists = [dense_ranked]  # 未启用 BM25 时只保留 dense 排序
 
         fused = reciprocal_rank_fusion(
-            ranked_lists,
-            k=self.settings.hybrid_rrf_k,
-        )  # RRF 融合得分，返回 (doc_id, score) 降序
-        top_child_ids = [doc for doc, _ in fused[:30]]  # 取融合后前若干子块
+            ranked_lists,  # 多路排序输入
+            k=self.settings.hybrid_rrf_k,  # RRF 衰减参数
+        )
+        top_child_ids = [doc for doc, _ in fused[:30]]  # 融合后取前30个子块
 
-        parent_ids_ordered: list[int] = []
-        seen = set()
+        # ---------------------------------------------------------------------
+        # 步骤8：子块 -> 父文档回溯（去重保持顺序）
+        # ---------------------------------------------------------------------
+        parent_ids_ordered: list[int] = []  # 有序父id列表
+        seen: set[int] = set()  # 去重集合
         for cid in top_child_ids:  # 按融合顺序遍历子块
-            ent = next((e for hid, _, e in legal_parsed if hid == cid), {})  # 找回该子块实体字段
-            pid = ent.get("parent_id")
-            if pid is None:
+            ent = next((e for hid, _, e in legal_parsed if hid == cid), {})  # 找到对应实体字段
+            pid = ent.get("parent_id")  # 取父文档 id
+            if pid is None:  # 命中缺少 parent_id 时跳过该子块
                 continue
-            pid = int(pid)
-            if pid not in seen:  # 父文档去重并保持首次出现顺序
+            pid = int(pid)  # 转 int
+            if pid not in seen:  # 未出现过才加入
                 seen.add(pid)
                 parent_ids_ordered.append(pid)
 
-        parent_texts_map = await self._fetch_parents(parent_ids_ordered)  # 批量拉父文档全文
-        passages = [parent_texts_map[pid] for pid in parent_ids_ordered if parent_texts_map.get(pid)]  # 按序组装 passages
-        if not passages:  # 父文档均被过滤空
+        parent_texts_map = await self._fetch_parents(parent_ids_ordered)  # 批量回查父文档全文
+        passages = [
+            parent_texts_map[pid]
+            for pid in parent_ids_ordered
+            if parent_texts_map.get(pid)  # 过滤空文本
+        ]
+
+        if not passages:  # 回查后父文档正文为空或缺失
             async for p in self._stream_simple_llm(
                 [
-                    SystemMessage(content=RAG_SYSTEM),
+                    SystemMessage(content=RAG_SYSTEM),  # 用 RAG 系统提示
                     HumanMessage(content=augment_question_with_memory(question, memory_snippet)),
                 ],
             ):
                 yield p
-            return
+            return  # 执行兜底路径后结束
 
-        reranker = self._reranker()
-        scores = await reranker.rank(question, passages)  # CrossEncoder 打分
-        ranked_idx = sorted(range(len(passages)), key=lambda i: scores[i], reverse=True)  # 得分降序索引
-        top_n = self.settings.legal_rerank_top_n
-        final_ctx = [passages[i] for i in ranked_idx[:top_n]]  # 取 Top-N 父文档全文作为上下文
+        # ---------------------------------------------------------------------
+        # 步骤9：重排（CrossEncoder）
+        # ---------------------------------------------------------------------
+        reranker = self._reranker()  # 获取重排服务（懒加载）
+        scores = await reranker.rank(question, passages)  # 对父文档逐条打分
+        ranked_idx = sorted(
+            range(len(passages)),
+            key=lambda i: scores[i],  # 按分数排序
+            reverse=True,
+        )
+        top_n = self.settings.legal_rerank_top_n  # 取前N条
+        final_ctx = [passages[i] for i in ranked_idx[:top_n]]  # 最终上下文
 
+        # ---------------------------------------------------------------------
+        # 步骤10：RAG 生成
+        # ---------------------------------------------------------------------
         async for p in self._rag_stream_llm(
-            question,
-            final_ctx,
-            memory_snippet=memory_snippet,
-            user_external_id=user_external_id,
+            question=question,  # 原问题
+            contexts=final_ctx,  # 重排后的上下文
+            memory_snippet=memory_snippet,  # 用户历史记忆
+            user_external_id=user_external_id,  # 用户标识（缓存隔离）
         ):
-            yield p
+            yield p  # 逐片返回
 
-    async def _rag_stream_llm(
+    async def _rag_stream_llm(  # RAG 生成子流程：带参考资料的流式输出并写缓存
         self,
-        question: str,
-        contexts: list[str],
+        question: str,  # 用户问题
+        contexts: list[str],  # 检索得到的参考资料列表
         *,
-        memory_snippet: str | None = None,
-        user_external_id: str | None = None,
+        memory_snippet: str | None = None,  # 可选：历史记忆文本
+        user_external_id: str | None = None,  # 可选：用户标识（用于缓存 scope）
     ) -> AsyncIterator[str]:
-        """使用 RAG 系统提示词与拼装后的参考资料进行流式生成，并在结束后写入缓存。
-
-        入参:
-            question: 用户问题原文。
-            contexts: 已进入 Prompt 的参考资料片段列表（父文档或 FAQ 拼块）。
-            memory_snippet: 可选近期对话格式串。
-            user_external_id: 可选，用于拼缓存 key 与区分用户。
-        返回:
-            异步迭代器，逐片产出模型生成文本；结束后将完整答案写入 Redis（route=rag_llm）。
         """
-        scope = f"{(user_external_id or '').strip()}:{question}"
-        key = cache_key_for_query(scope)
-        llm = self._llm()  # 每次调用新建 ChatOpenAI（内部 httpx 客户端仍单例）
+        带检索上下文的流式生成路径。
+
+        行为：
+        - 构造 RAG 系统消息 + 用户消息
+        - 流式产出模型文本
+        - 结束后写入缓存（route=rag_llm）
+        """
+        scope = f"{(user_external_id or '').strip()}:{question}"  # 拼接用户隔离作用域
+        key = cache_key_for_query(scope)  # 根据作用域生成缓存键
+        llm = self._llm()  # 创建本次生成使用的 LLM 客户端
         messages = [
-            SystemMessage(content=RAG_SYSTEM),
-            HumanMessage(content=build_user_message(question, contexts, memory_snippet)),
+            SystemMessage(content=RAG_SYSTEM),  # 专业 RAG 系统提示
+            HumanMessage(content=build_user_message(question, contexts, memory_snippet)),  # 用户消息（问题+上下文+记忆）
         ]
-        buf: list[str] = []  # 拼接完整回答以便缓存
-        async for chunk in llm.astream(messages):  # LangChain 异步 token 流
-            if isinstance(chunk, AIMessageChunk) and chunk.content:
-                buf.append(str(chunk.content))
-                yield str(chunk.content)
+
+        buf: list[str] = []  # 收集所有分片文本，最终拼成完整答案
+        async for chunk in llm.astream(messages):  # 异步流式接收 token chunk
+            if isinstance(chunk, AIMessageChunk) and chunk.content:  # 过滤空 chunk
+                text_piece = str(chunk.content)  # 统一转字符串
+                buf.append(text_piece)  # 累积完整答案
+                yield text_piece  # 向上游逐片输出
+
+        # 流式结束后写缓存，便于同问题命中
         await self._cache.set_json(
             key,
             {"answer": "".join(buf), "route": "rag_llm"},
             self.settings.cache_ttl_seconds,
-        )  # 仅带参考资料生成的路径写 Redis，便于重复提问命中
+        )
 
-    async def _stream_simple_llm(self, messages: list) -> AsyncIterator[str]:
-        """不使用参考资料时的通用流式生成（意图引导、无命中兜底等）；默认不写长期缓存。
-
-        入参:
-            messages: LangChain 消息列表（SystemMessage / HumanMessage 等）。
-        返回:
-            异步迭代器，逐片产出模型文本；本路径刻意不写与专业问答共享的缓存 key。
+    async def _stream_simple_llm(  # 简单生成子流程：无检索上下文，仅做引导/兜底回复
+        self,
+        messages: list,  # 调用方传入的 LangChain 消息列表
+    ) -> AsyncIterator[str]:
         """
-        llm = self._llm()
-        buf: list[str] = []
-        async for chunk in llm.astream(messages):
-            if isinstance(chunk, AIMessageChunk) and chunk.content:
-                buf.append(str(chunk.content))
-                yield str(chunk.content)
-        _ = buf  # 占位：避免未使用变量告警；刻意不缓存闲聊引导内容，防止缓存污染专业问答 key
+        不带检索上下文的简单生成路径（闲聊引导 / 无命中兜底）。
+
+        说明：
+        - 本路径默认不写“专业问答同 key”缓存，避免污染专业缓存。
+        """
+        llm = self._llm()  # 创建 LLM 客户端用于流式生成
+        buf: list[str] = []  # 收集分片文本（当前仅为占位，不用于缓存写入）
+        async for chunk in llm.astream(messages):  # 流式生成
+            if isinstance(chunk, AIMessageChunk) and chunk.content:  # 过滤空 chunk
+                text_piece = str(chunk.content)  # 统一转字符串
+                buf.append(text_piece)  # 累积
+                yield text_piece  # 输出
+        _ = buf  # 显式占位，强调此路径不写专业缓存

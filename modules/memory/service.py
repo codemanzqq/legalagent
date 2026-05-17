@@ -1,5 +1,7 @@
 # =============================================================================
 # 教学说明：本文件在整体链路中的位置
+# 用户聊天数据的数据库访问层，核心围绕 users_tab（用户表）和 his_chat_tab（聊天记录表）做
+# 用户 ID 解析、聊天记录查询、记录格式化、聊天记录落库 4 个核心操作。
 # -----------------------------------------------------------------------------
 # 输入：`AsyncSession` + `external_id` / `user_id`；或 SSE 结束后的 `question`/`answer` 文本。
 # 输出：`resolve_user_id` 返回 int；`fetch_recent_chat_lines` 返回 ORM 行列表；`persist_user_turn` 无返回（落库）。
@@ -23,8 +25,10 @@ DEFAULT_MEMORY_CONTEXT_LINES = 10  # 与 pipeline 里 fetch_recent_chat_lines �
 
 async def resolve_user_id(session: AsyncSession, external_id: str) -> int:
     """
-    SELECT users_tab by external_id；无则 INSERT 一行并 flush 得到自增 id。
+    主要作用：根据前端传的「用户外部标识（external_id）」，在数据库里找对应的内部主键 ID；如果用户是新的（没查到），
+    就自动创建一条用户记录并返回新生成的 ID。
 
+    SELECT users_tab by external_id；无则 INSERT 一行并 flush 得到自增 id。
     不在此 commit：调用方负责 commit（pipeline 在读完记忆后 commit 一次）。
 
     入参:
@@ -52,6 +56,7 @@ async def fetch_recent_chat_lines(
     limit: int = DEFAULT_MEMORY_CONTEXT_LINES,
 ) -> list[HisChatTab]:
     """
+    主要作用：拿着 user_id 去数据库里查最近 limit 条聊天记录，并按时间正序排列。
     ORDER BY created_at DESC LIMIT n，再在 Python 里 reverse，使列表按时间正序（旧→新）。
 
     正序便于 Prompt 里写「从早到晚」。
@@ -76,6 +81,7 @@ async def fetch_recent_chat_lines(
 
 def format_chat_history_for_prompt(rows: list[HisChatTab]) -> str:
     """
+    主要作用：把查到的聊天记录列表，转换成可以直接拼到 AI Prompt 里的中文字符串（有固定格式）；如果没记录，返回固定提示句。
     无记录时返回固定提示句；有记录则格式化为「序号. 用户问：… 助手答：…」多行文本。
 
     对超长 question/answer 做截断，避免撑爆模型上下文。
@@ -97,6 +103,7 @@ def format_chat_history_for_prompt(rows: list[HisChatTab]) -> str:
 
 async def persist_user_turn(external_id: str | None, question: str, answer: str) -> None:
     """
+    主要作用：把用户本轮的「问题 + 回答」写入数据库的聊天记录表；如果用户 ID 为空或回答为空，就不写入（避免无效数据）。
     独立开 session：INSERT his_chat_tab 一行并 commit。
 
     无 external_id 或空答案则 no-op，避免写入无意义行。

@@ -25,7 +25,9 @@ class ChatRequest(BaseModel):
 
 
 class HealthResponse(BaseModel):
-    """GET /health 返回的简单状态（便于负载均衡或探活）。"""
+    """GET /health 返回的简单状态（便于负载均衡或探活）。
+    是/health接口的响应模型，固定返回ok=True表示进程存活，assistant字段是对外展示的名称，和前端约定一致即可。
+    """
 
     ok: bool = True  # 固定为 True 表示进程存活（尚未对接 DB/Milvus 深度检查）
     assistant: str = "小易"  # 对外展示名称，可与前端约定一致

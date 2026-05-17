@@ -176,6 +176,8 @@ async def sync_mysql_to_milvus(*, recreate: bool = True) -> dict[str, Any]:
     if children:
         child_vecs = await emb.embed_documents([c.content for c in children])
 
+    #pymilvus 的操作是同步阻塞的，如果直接在 FastAPI 的异步循环里执行，会卡住整个服务；
+    # 用 asyncio.to_thread 丢到线程池，异步框架就能继续处理其他请求。
     await asyncio.to_thread(
         _blocking_milvus_full_write,
         dim,
@@ -192,7 +194,7 @@ async def sync_mysql_to_milvus(*, recreate: bool = True) -> dict[str, Any]:
         "legal_child_vectors": len(children),
     }
 
-
+#封装供外部调用的函数
 async def run_sync_job() -> dict[str, Any]:
     """
     对外稳定入口：固定全量 recreate，供脚本与热更新共用。
