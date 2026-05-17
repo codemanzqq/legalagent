@@ -1,4 +1,8 @@
-"""Pydantic 模型：校验 HTTP 请求体与响应体字段类型与取值范围。"""
+"""
+Pydantic 模型：
+核心作用是用 Pydantic 做数据校验，这是 FastAPI 项目的最佳实践 —— 前端传过来的参数、后端返回的结果，
+都要通过 Pydantic 模型约束，既保证数据合法性，又能自动生成 OpenAPI 文档。
+"""
 
 from pydantic import BaseModel, Field  # BaseModel：声明数据类；Field：字段约束、默认值与 OpenAPI 文档
 

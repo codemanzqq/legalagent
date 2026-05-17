@@ -91,7 +91,7 @@ def _build_client() -> redis.Redis:
 
 def get_redis() -> redis.Redis:
     """
-    对外暴露单例：多处 `RedisCache(get_redis())` 共享同一连接池。
+    对外暴露单例：多处 `RedisCache(get_redis())` 共享同一连接池。所有需要 Redis 客户端的地方，都通过这个函数获取，共享连接池
 
     入参:
         无。
