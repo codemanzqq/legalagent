@@ -31,7 +31,7 @@ router = APIRouter(prefix="/chat", tags=["chat"])  # 最终路径 = /api + /chat
 @router.post("/stream")
 async def chat_stream(
     body: ChatRequest,
-    pipeline: RagPipeline = Depends(get_pipeline),
+    pipeline: RagPipeline = Depends(get_pipeline), # 依赖注入：`pipeline` 由框架调用 `get_pipeline()` 填入。
 ) -> StreamingResponse:
     """
     异步生成器 `gen`：迭代 `pipeline.stream_chat`，把每个片段包装成 SSE 行。
@@ -63,7 +63,7 @@ async def chat_stream(
                 #json.dumps(...)：把 {"chunk": "回答片段"} 转成 JSON 字符串（确保中文不转义，ensure_ascii=False）；
                 #yield：生成器关键字，每执行一次 yield，就会把这一行 SSE 格式的字符串返回给前端；
                 #格式要求：data: ...\n\n 是 SSE 协议强制的，前端的 EventSource 才能识别；
-                yield f"data: {json.dumps({'chunk': piece}, ensure_ascii=False)}\n\n"  # SSE 要求双换行结束事件
+                yield f"data: {json.dumps({'chunk': piece}, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"  # 所有回答片段返回完后，给前端发一个 [DONE] 标识，前端收到后就知道流结束了
         except Exception as exc:  # noqa: BLE001 — 任意异常转成 JSON 事件给前端展示
             err = {"error": str(exc)}

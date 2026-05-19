@@ -1,8 +1,8 @@
 # =============================================================================
 # 教学说明：本文件在整体链路中的位置
-# -----------------------------------------------------------------------------
-# 输入：FastAPI `app` 实例（仅类型用）；配置项 `HOT_UPDATE_ENABLED`、间隔秒数。
-# 输出：`asynccontextmanager`：yield 前完成建表、连 Milvus、可选后台任务；yield 后取消任务。
+# 这是 FastAPI 框架的「生命周期管理文件」，负责应用启动 / 关闭时的核心操作；
+# 启动时要做 3 件事：检查 / 创建 MySQL 表、连接 Milvus（向量数据库）、可选启动「MySQL→Milvus 数据同步的后台任务」；
+# 关闭时要优雅停止这个后台同步任务；
 # 被谁调用：`main.py` 中 `FastAPI(..., lifespan=app_lifespan)`，由 ASGI 服务器在启动/关闭时驱动。
 # =============================================================================
 """
@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 async def _ensure_tables() -> None:
     """
+    核心作用：创建数据库表
     `Base.metadata.create_all`：已存在的表不会删数据，只补缺失表（开发友好）。
 
     入参:
@@ -45,6 +46,7 @@ async def _ensure_tables() -> None:
 
 async def _ensure_milvus() -> None:
     """
+    核心作用：确保 Milvus 连接
     `ensure_milvus` 为同步阻塞：用 to_thread 避免阻塞 asyncio 启动阶段其它协程。
 
     入参:
@@ -57,9 +59,7 @@ async def _ensure_milvus() -> None:
 
 async def _hot_update_loop(stop: asyncio.Event) -> None:
     """
-    循环：每 `interval` 秒或被 `stop` 唤醒；超时则尝试 `run_sync_job()`。
-
-    `stop.wait()` 与 `wait_for` 结合：既支持定时又支持优雅退出。
+    核心作用：定时全量同步 MySQL 到 Milvus
 
     入参:
         stop: 应用关闭时 set 的事件，用于打断循环。
@@ -76,20 +76,20 @@ async def _hot_update_loop(stop: asyncio.Event) -> None:
             pass  # 正常定时唤醒
         else:
             break  # stop.wait() 返回说明 Event 已触发，退出 while
-        if not settings.hot_update_enabled:  # 运行中可在下一轮检查（注：settings 非热重载单例细节略）
+        if not settings.hot_update_enabled:  # 如果热更新未启用，则跳过本次循环
             continue
         try:
             await run_sync_job()  # 异步全量同步（内部 to_thread 写 Milvus）
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 — 任意异常转成 JSON 事件给前端展示
             logger.exception("hot milvus sync failed: %s", exc)
 
 
 @asynccontextmanager
 async def app_lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
-    FastAPI 约定：`yield` 之前是 startup，`yield` 之后是 shutdown（在 finally 语义里）。
+    核心作用：启动时确保 MySQL 表结构和 Milvus 连接，并启动定时全量同步任务。
+    关闭时取消定时全量同步任务。
 
-    `yield` 的值类型此处为 `None`，表示不向上下文块传递对象。
 
     入参:
         app: FastAPI 应用实例（当前实现未直接使用，保留签名兼容框架）。
@@ -99,17 +99,24 @@ async def app_lifespan(app: FastAPI) -> AsyncIterator[None]:
     await _ensure_tables()
     await _ensure_milvus()
     settings = get_settings()
-    stop = asyncio.Event()  # 子任务看此事件决定是否退出
-    task: asyncio.Task | None = None
-    if settings.hot_update_enabled:
-        task = asyncio.create_task(_hot_update_loop(stop))  # 丢到事件循环并发执行
+    stop = asyncio.Event()  # 创建一个事件对象，用于通知后台循环结束
+    task: asyncio.Task | None = None # 创建一个异步任务，用于定时全量同步 MySQL 到 Milvus的后台任务
+    if settings.hot_update_enabled: # 如果热更新启用，则启动定时全量同步任务
+        task = asyncio.create_task(_hot_update_loop(stop))
     try:
         yield  # 此处放行：开始接受 HTTP 请求
     finally:
         stop.set()  # 通知后台循环结束
         if task:
-            task.cancel()  # 向 Task 注入 CancelledError
+            task.cancel()  # 向 Task 注入 CancelledError，强制取消任务
             try:
                 await task  # 等待任务真正结束
-            except asyncio.CancelledError:
+            except asyncio.CancelledError: # 如果任务被取消，则忽略异常
                 pass  # 取消是预期路径
+
+"""
+yield: FastAPI 固定写法
+yield 之前 = 启动 :安全开启后台循环任务（自动同步数据 / 定时刷新）
+yield 之后 = 运行服务（接收请求）：后台任务和 HTTP 请求同时跑（互不干扰）
+yield之后是 关闭 （在 finally 语义里）:优雅杀死后台任务（不崩、不残留、不卡死程序）。
+"""
