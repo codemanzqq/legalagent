@@ -1,0 +1,47 @@
+# 敏感信息 - 永远不要提交
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+application-local.yml
+application-local.yaml
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+*~
+
+# 构建产物
+**/target/
+**/build/
+**/dist/
+
+# Node.js (前端)
+**/node_modules/
+frontend/.env.local
+frontend/dist/
+
+# 日志
+*.log
+logs/
+
+# 操作系统
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 测试
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 临时文件
+*.tmp
+*.bak
+.tmp/

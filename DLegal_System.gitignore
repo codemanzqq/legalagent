@@ -1,0 +1,50 @@
+# 敏感信息 - 永远不要提交
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.env.python
+*.egg-info/
+dist/
+build/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+*~
+
+# 日志
+*.log
+logs/
+
+# 操作系统
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 测试
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 数据文件（可选，如果太大建议不提交）
+# data/*.pdf
+# data/*.xlsx
+
+# 模型文件（体积大，建议不提交）
+models/*.bin
+models/*.h5
+models/*.pkl
